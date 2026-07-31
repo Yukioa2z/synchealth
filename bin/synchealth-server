@@ -1,0 +1,613 @@
+#!/usr/bin/env python3
+"""synchealth-server — receives HealthKit pushes from the phone and folds them
+into the same health.db that synchealth-import builds.
+
+Runs on an always-on machine. Two ways in, both landing in one schema:
+
+  POST /health   HAE-format json (the de-facto standard: Health Auto Export,
+                 FreeReps and the Shortcuts recipes all emit it). Four arrays
+                 are consumed: metrics, workouts, category_samples (sleep
+                 stages, stand hours, and the PRIVATE_TYPES set which lands in
+                 its own table, out of every reporting path) and
+                 activity_summaries (the rings).
+  GET  /health/summary?days=N   last-N-day digest, for eyeballing that the
+                 pipeline is alive without opening sqlite
+  GET  /health/alive            unauthenticated liveness, carries no data
+
+Auth is a shared secret in the X-Health-Token header, checked in constant time.
+This is NOT optional: the endpoint is typically reachable from the public
+internet through a tunnel, and the body it accepts is blood oxygen, heart rate
+and whatever else HealthKit holds. Without a token the process refuses to start.
+
+Every accepted payload is written verbatim to raw/<ts>-<n>.json BEFORE
+aggregation. If the folding logic is ever wrong, the source of truth is still
+on disk and a re-fold costs nothing — the same reason synchealth-watch keeps
+the original export.xml.gz.
+
+Config: $SYNCHEALTH_HOME/server.json
+  {"token": "<shared secret>", "bind": "127.0.0.1", "port": 8738}
+bind defaults to loopback because a tunnel daemon connects locally; set it to a
+LAN or VPN address only if something on that network must reach it directly.
+"""
+import hmac
+import json
+import os
+import sqlite3
+import sys
+import time
+from datetime import date, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+HOME = Path(os.path.expanduser(os.environ.get("SYNCHEALTH_HOME", "~/.synchealth")))
+DB = HOME / "health.db"
+RAW = HOME / "raw"
+CONF = HOME / "server.json"
+MAX_BODY = 64 * 1024 * 1024  # HAE payloads run to MBs; a 64KB cap is far too small
+
+# HAE ships snake_case names; export.xml ships HealthKit identifiers. Same
+# metric under two spellings would land as two rows per day, so normalise onto
+# the export.xml spelling — that importer owns the historical backfill.
+# Unmapped names pass through unchanged rather than being dropped: a new
+# HealthKit type is data we want, even before this table knows about it.
+HAE_TO_HK = {
+    "step_count": "StepCount",
+    "heart_rate": "HeartRate",
+    "resting_heart_rate": "RestingHeartRate",
+    "walking_heart_rate_average": "WalkingHeartRateAverage",
+    "heart_rate_variability": "HeartRateVariabilitySDNN",
+    "respiratory_rate": "RespiratoryRate",
+    "blood_oxygen_saturation": "OxygenSaturation",
+    "oxygen_saturation": "OxygenSaturation",
+    "active_energy": "ActiveEnergyBurned",
+    "basal_energy_burned": "BasalEnergyBurned",
+    "apple_exercise_time": "AppleExerciseTime",
+    "apple_stand_time": "AppleStandTime",
+    "apple_stand_hour": "AppleStandHour",
+    "stand_hours": "AppleStandHour",
+    "walking_running_distance": "DistanceWalkingRunning",
+    "cycling_distance": "DistanceCycling",
+    "flights_climbed": "FlightsClimbed",
+    "weight_body_mass": "BodyMass",
+    "body_mass_index": "BodyMassIndex",
+    "body_fat_percentage": "BodyFatPercentage",
+    "lean_body_mass": "LeanBodyMass",
+    "height": "Height",
+    "vo2_max": "VO2Max",
+    "time_in_daylight": "TimeInDaylight",
+    "physical_effort": "PhysicalEffort",
+    "walking_speed": "WalkingSpeed",
+    "walking_step_length": "WalkingStepLength",
+    "walking_asymmetry_percentage": "WalkingAsymmetryPercentage",
+    "walking_double_support_percentage": "WalkingDoubleSupportPercentage",
+    "apple_walking_steadiness": "AppleWalkingSteadiness",
+    "stair_ascent_speed": "StairAscentSpeed",
+    "stair_descent_speed": "StairDescentSpeed",
+    "headphone_audio_exposure": "HeadphoneAudioExposure",
+    "environmental_audio_exposure": "EnvironmentalAudioExposure",
+    "six_minute_walking_test_distance": "SixMinuteWalkTestDistance",
+    "swimming_stroke_count": "SwimmingStrokeCount",
+    "sexual_activity": "SexualActivity",
+    "menstrual_flow": "MenstrualFlow",
+}
+
+# Same per-metric aggregation contract as synchealth-import. Kept as its own
+# table rather than imported: this file must run standalone on the always-on
+# machine, and the duplication is 30 lines against a cross-file dependency at
+# request time.
+CANONICAL = {
+    "StepCount": "sum", "DistanceWalkingRunning": "sum", "DistanceCycling": "sum",
+    "FlightsClimbed": "sum", "ActiveEnergyBurned": "sum", "BasalEnergyBurned": "sum",
+    "AppleExerciseTime": "sum", "AppleStandTime": "sum", "TimeInDaylight": "sum",
+    "SwimmingStrokeCount": "sum", "AppleStandHour": "sum",
+    "BodyMass": "last", "BodyMassIndex": "last", "BodyFatPercentage": "last",
+    "LeanBodyMass": "last", "Height": "last",
+}
+PERCENT_METRICS = {
+    "OxygenSaturation", "BodyFatPercentage", "AppleWalkingSteadiness",
+    "WalkingAsymmetryPercentage", "WalkingDoubleSupportPercentage",
+}
+# HAE already reports these in real percent, unlike export.xml's 0-1 fractions.
+# Scaling twice would report 9800% oxygen, so only scale a value that is
+# unambiguously a fraction.
+PERCENT_FRACTION_CEILING = 1.5
+
+
+def load_conf():
+    if not CONF.exists():
+        sys.exit(f"missing {CONF} — create it with a token before starting")
+    conf = json.loads(CONF.read_text())
+    if not conf.get("token") or len(conf["token"]) < 16:
+        sys.exit("server.json needs a token of at least 16 chars")
+    return conf
+
+
+def parse_time(s):
+    """HAE stamps are '2026-07-26 14:03:21 +0800'; some emitters send ISO or a
+    bare date. Returns (day, datetime) — day is what the schema keys on."""
+    if not s:
+        return None, None
+    s = s.strip()
+    for layout in ("%Y-%m-%d %H:%M:%S %z", "%Y-%m-%dT%H:%M:%S%z",
+                   "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(s, layout)
+            return dt.date().isoformat(), dt
+        except ValueError:
+            continue
+    return (s[:10] if len(s) >= 10 else None), None
+
+
+def point_value(name, dp):
+    """One data point -> float, across HAE's three shapes. heart_rate carries
+    Min/Avg/Max instead of qty; blood_pressure carries systolic/diastolic."""
+    if "qty" in dp and dp["qty"] is not None:
+        return float(dp["qty"])
+    for k in ("Avg", "avg"):
+        if dp.get(k) is not None:
+            return float(dp[k])
+    for k in ("systolic", "Systolic"):
+        if dp.get(k) is not None:
+            return float(dp[k])
+    return None
+
+
+def sleep_night(dt):
+    """(night, kind), matching synchealth-import's boundaries exactly.
+
+    A 10:00-18:00 start is a nap, not a night: a watch catches afternoon naps
+    far more reliably than it catches actual nights, and folding one into the
+    night's total reports a nap as a sleep deficit. Any drift between this and
+    the importer's version would put the same segment in two different buckets
+    depending on which path wrote it.
+    """
+    if 10 <= dt.hour < 18:
+        return dt.date().isoformat(), "nap"
+    if dt.hour < 10:
+        return (dt.date() - timedelta(days=1)).isoformat(), "night"
+    return dt.date().isoformat(), "night"
+
+
+def fold(payload, db):
+    """Fold one HAE payload into daily/sleep/workouts/rings. Returns a count dict.
+
+    Every emitter in this space re-sends: HAE automations post rolling windows,
+    FreeReps re-syncs on observer wakeups, and the whole point of a rolling
+    window is that a missed day heals itself. So a push must be idempotent —
+    posting the same body twice cannot double the day's steps.
+
+    That rules out accumulating into the stored aggregate. Instead each
+    (day, metric, point-timestamp, value) is recorded in `samples`, and the
+    day's aggregate is recomputed from the deduped sample set. Re-posting the
+    same points is then a no-op, while a later push covering new hours still
+    extends the day. Cost is one row per point (a few hundred a day).
+    """
+    data = payload.get("data") or {}
+    counts = {"metrics": 0, "points": 0, "sleep": 0, "workouts": 0,
+              "rings": 0, "skipped": 0}
+
+    per_day = {}   # (day, metric) -> accumulator
+    sleep_rows = {}
+
+    for m in data.get("metrics") or []:
+        name = m.get("name") or ""
+        metric = HAE_TO_HK.get(name, name)
+        unit = m.get("units")
+        counts["metrics"] += 1
+
+        if metric in ("SleepAnalysis", "sleep_analysis"):
+            for dp in m.get("data") or []:
+                if "totalSleep" in dp:      # aggregated: one row per night
+                    day = (dp.get("date") or "")[:10]
+                    if not day:
+                        continue
+                    for state, key in (("AsleepCore", "core"), ("AsleepDeep", "deep"),
+                                       ("AsleepREM", "rem"), ("Awake", "awake"),
+                                       ("InBed", "inBed")):
+                        v = dp.get(key)
+                        if v:
+                            sleep_rows[(day, state, "night")] = float(v) * 60.0
+                    # HAE reports hours; only fall back to the undifferentiated
+                    # total when no stage breakdown came through, else the same
+                    # minutes would be counted twice.
+                    if not any(dp.get(k) for k in ("core", "deep", "rem")):
+                        tot = dp.get("totalSleep") or dp.get("asleep")
+                        if tot:
+                            sleep_rows[(day, "AsleepUnspecified", "night")] = float(tot) * 60.0
+                    counts["sleep"] += 1
+                elif "startDate" in dp:     # per-stage segments
+                    d1, dt1 = parse_time(dp.get("startDate"))
+                    _, dt2 = parse_time(dp.get("endDate"))
+                    if not dt1 or not dt2:
+                        continue
+                    state = (dp.get("value") or "Unknown").replace(
+                        "HKCategoryValueSleepAnalysis", "")
+                    mins = (dt2 - dt1).total_seconds() / 60.0
+                    night, kind = sleep_night(dt1)
+                    k = (night, state or "Unknown", kind)
+                    sleep_rows[k] = sleep_rows.get(k, 0.0) + mins
+                    counts["sleep"] += 1
+            continue
+
+        if metric in PRIVATE_TYPES:
+            # Metrics-array spelling of a private type. Only category_samples
+            # carries the sample id these need, so a metrics-array entry has no
+            # stable key and is counted, not stored — the category_samples path
+            # below is where these actually land.
+            counts["skipped"] += len(m.get("data") or [])
+            continue
+
+        for dp in m.get("data") or []:
+            if not isinstance(dp, dict):
+                counts["skipped"] += 1
+                continue
+            day, _ = parse_time(dp.get("date") or dp.get("startDate"))
+            v = point_value(name, dp)
+            if day is None or v is None:
+                counts["skipped"] += 1
+                continue
+            if metric in PERCENT_METRICS and abs(v) <= PERCENT_FRACTION_CEILING:
+                v *= 100.0
+            a = per_day.setdefault((day, metric), {"unit": unit, "points": []})
+            a["points"].append((dp.get("date") or dp.get("startDate") or "", v))
+            counts["points"] += 1
+
+    with db:
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS samples ("
+            " day TEXT NOT NULL, metric TEXT NOT NULL, at TEXT NOT NULL,"
+            " value REAL, unit TEXT, PRIMARY KEY (day, metric, at, value))")
+        for (day, metric), a in per_day.items():
+            db.executemany(
+                "INSERT OR IGNORE INTO samples (day,metric,at,value,unit)"
+                " VALUES (?,?,?,?,?)",
+                [(day, metric, at, v, a["unit"]) for at, v in a["points"]])
+            # Recompute purely from the deduped sample set. Comparing sample
+            # counts against an export.xml-imported row would be wrong — the
+            # two sources cut the day into different numbers of buckets, so
+            # "more rows" says nothing about which is more complete. Instead the
+            # push owns days it has samples for, and a re-import of export.xml
+            # (which is idempotent and authoritative) is the repair path when a
+            # push covered a day only partially.
+            agg_row = db.execute(
+                "SELECT sum(value), count(*), min(value), max(value)"
+                " FROM samples WHERE day=? AND metric=?", (day, metric)).fetchone()
+            s_sum, s_n, s_min, s_max = agg_row
+            if not s_n:
+                continue
+            last = db.execute(
+                "SELECT value FROM samples WHERE day=? AND metric=?"
+                " ORDER BY at DESC LIMIT 1", (day, metric)).fetchone()[0]
+            avg = s_sum / s_n if s_n else None
+            stat = CANONICAL.get(metric, "avg")
+            canon = {"sum": s_sum, "avg": avg, "last": last}[stat]
+            db.execute(
+                "INSERT INTO daily (day,metric,unit,stat,value,sum,avg,min,max,last,n)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(day,metric) DO UPDATE SET unit=excluded.unit,"
+                " stat=excluded.stat, value=excluded.value, sum=excluded.sum,"
+                " avg=excluded.avg, min=excluded.min, max=excluded.max,"
+                " last=excluded.last, n=excluded.n",
+                (day, metric, a["unit"], stat, canon, s_sum, avg,
+                 s_min, s_max, last, s_n))
+
+        for (night, state, kind), mins in sleep_rows.items():
+            # Sleep is authoritative per push: the phone recomputes the whole
+            # night, so replace rather than accumulate (accumulating would
+            # double a night that gets pushed twice).
+            db.execute(
+                "INSERT INTO sleep (night,state,kind,minutes,n) VALUES (?,?,?,?,1)"
+                " ON CONFLICT(night,state,kind) DO UPDATE SET"
+                " minutes=excluded.minutes",
+                (night, state, kind, mins))
+
+        for w in data.get("workouts") or []:
+            start, _ = parse_time(w.get("start"))
+            if not w.get("start"):
+                continue
+            db.execute(
+                "INSERT INTO workouts (start,end,activity,minutes,source)"
+                " VALUES (?,?,?,?,?) ON CONFLICT(start) DO UPDATE SET"
+                " end=excluded.end, activity=excluded.activity,"
+                " minutes=excluded.minutes, source=excluded.source",
+                (w.get("start"), w.get("end"), w.get("name"),
+                 float(w.get("duration") or 0), w.get("source") or "push"))
+            counts["workouts"] += 1
+
+        fold_category_samples(data.get("category_samples") or [], db, counts)
+        fold_activity_summaries(data.get("activity_summaries") or [], db, counts)
+    return counts
+
+
+# HAE spells sleep stages as display labels; the schema (and the sleep_nights
+# view's COALESCE ladder) speaks export.xml's HKCategoryValueSleepAnalysis
+# vocabulary. Unmapped labels pass through so a new stage still lands as data.
+SLEEP_LABELS = {
+    "Asleep": "AsleepUnspecified",
+    "Asleep Unspecified": "AsleepUnspecified",
+    "Core": "AsleepCore",
+    "Asleep Core": "AsleepCore",
+    "Deep": "AsleepDeep",
+    "Asleep Deep": "AsleepDeep",
+    "REM": "AsleepREM",
+    "Asleep REM": "AsleepREM",
+    "Awake": "Awake",
+    "In Bed": "InBed",
+    "InBed": "InBed",
+}
+
+# Category types kept in their own table, deliberately outside `daily`/`samples`.
+# `daily` is the shared read surface, and /health/summary enumerates every metric
+# it finds there — so a row in `daily` is a row in the digest. (The `health` CLI
+# is safer: it iterates health-targets.json, which does not list these, so they
+# only appear if you name one explicitly.) A separate table keeps the data
+# queryable on request and out of every automatic summary. Nothing reads
+# `private_events`; that is the point.
+#
+# Add any HealthKit type you would not want appearing in a digest you might
+# show someone: reproductive health, mental-state logging, medication.
+PRIVATE_TYPES = {"SexualActivity"}
+
+
+def fold_category_samples(samples, db, counts):
+    """Fold data.category_samples — the array most integrations forget.
+
+    This is where sleep actually arrives. HAE only puts SleepAnalysis under
+    data.metrics when the user enables the aggregated "Sleep" metric; the raw
+    per-stage segments ride in category_samples instead, alongside
+    AppleStandHour. Ignoring the array means `sleep` silently stops advancing
+    while every push carries the segments.
+
+    Segments are deduped by their HealthKit sample id and the night is
+    recomputed from the deduped set — the same contract the metrics path uses,
+    and for the same reason: HAE re-sends a rolling window, so accumulating
+    would double a re-pushed night while replacing with a partial window would
+    truncate a real one.
+    """
+    seg_rows, stand, private = [], {}, []
+    for c in samples:
+        ctype = (c.get("type") or "").split("Identifier")[-1]
+        sid = c.get("id")
+        if ctype in PRIVATE_TYPES:
+            day, dt1 = parse_time(c.get("start_date") or c.get("startDate"))
+            _, dt2 = parse_time(c.get("end_date") or c.get("endDate"))
+            if day is None or not sid:
+                counts["skipped"] += 1
+                continue
+            mins = (dt2 - dt1).total_seconds() / 60.0 if dt1 and dt2 else 0.0
+            private.append((sid, ctype, day,
+                            c.get("start_date") or c.get("startDate"), mins,
+                            (c.get("value_label") or "").strip(),
+                            c.get("source") or "push"))
+        elif ctype == "SleepAnalysis":
+            _, dt1 = parse_time(c.get("start_date") or c.get("startDate"))
+            _, dt2 = parse_time(c.get("end_date") or c.get("endDate"))
+            if not dt1 or not dt2 or not sid:
+                counts["skipped"] += 1
+                continue
+            label = (c.get("value_label") or "").strip()
+            state = SLEEP_LABELS.get(label, label.replace(" ", "") or "Unknown")
+            night, kind = sleep_night(dt1)
+            seg_rows.append((sid, night, state, kind,
+                             (dt2 - dt1).total_seconds() / 60.0))
+        elif ctype == "AppleStandHour":
+            day, _ = parse_time(c.get("start_date") or c.get("startDate"))
+            if day is None or not sid:
+                counts["skipped"] += 1
+                continue
+            # value 1 = Stood, 0 = Idle, so summing the values counts stood
+            # hours. Note this is stricter than synchealth-import, which sees
+            # export.xml's non-numeric value and counts every record as 1 —
+            # i.e. Stood + Idle. `rings.stand_hours` is the number to trust for
+            # history; this column is only reliable for push-covered days.
+            stand.setdefault(day, []).append(
+                (c.get("start_date") or c.get("startDate"),
+                 float(c.get("value") or 0)))
+        else:
+            counts["skipped"] += 1
+
+    if private:
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS private_events ("
+            " id TEXT PRIMARY KEY, type TEXT NOT NULL, day TEXT NOT NULL,"
+            " at TEXT, minutes REAL, value_label TEXT, source TEXT)")
+        db.executemany(
+            "INSERT INTO private_events (id,type,day,at,minutes,value_label,source)"
+            " VALUES (?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET"
+            " day=excluded.day, at=excluded.at, minutes=excluded.minutes,"
+            " value_label=excluded.value_label, source=excluded.source", private)
+        # Counted separately from `points` so the server log doesn't imply these
+        # rows landed in the reporting tables.
+        counts["private"] = counts.get("private", 0) + len(private)
+
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS sleep_segments ("
+        " id TEXT PRIMARY KEY, night TEXT NOT NULL, state TEXT NOT NULL,"
+        " kind TEXT NOT NULL, minutes REAL)")
+    if seg_rows:
+        db.executemany(
+            "INSERT INTO sleep_segments (id,night,state,kind,minutes)"
+            " VALUES (?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET"
+            " night=excluded.night, state=excluded.state,"
+            " kind=excluded.kind, minutes=excluded.minutes", seg_rows)
+        # Recompute only the buckets this push touched. A (night, state, kind)
+        # the push says nothing about keeps whatever synchealth-import wrote —
+        # same "the push owns what it has samples for" rule as `daily`.
+        for night, state, kind in {(r[1], r[2], r[3]) for r in seg_rows}:
+            mins, n = db.execute(
+                "SELECT sum(minutes), count(*) FROM sleep_segments"
+                " WHERE night=? AND state=? AND kind=?",
+                (night, state, kind)).fetchone()
+            db.execute(
+                "INSERT INTO sleep (night,state,kind,minutes,n) VALUES (?,?,?,?,?)"
+                " ON CONFLICT(night,state,kind) DO UPDATE SET"
+                " minutes=excluded.minutes, n=excluded.n",
+                (night, state, kind, mins, n))
+            counts["sleep"] += n
+
+    for day, points in stand.items():
+        db.executemany(
+            "INSERT OR IGNORE INTO samples (day,metric,at,value,unit)"
+            " VALUES (?,'AppleStandHour',?,?,'count')",
+            [(day, at, v) for at, v in points])
+        total, n = db.execute(
+            "SELECT sum(value), count(*) FROM samples"
+            " WHERE day=? AND metric='AppleStandHour'", (day,)).fetchone()
+        db.execute(
+            "INSERT INTO daily (day,metric,unit,stat,value,sum,avg,min,max,last,n)"
+            " VALUES (?,'AppleStandHour','count','sum',?,?,?,0,1,?,?)"
+            " ON CONFLICT(day,metric) DO UPDATE SET value=excluded.value,"
+            " sum=excluded.sum, avg=excluded.avg, min=excluded.min,"
+            " max=excluded.max, last=excluded.last, n=excluded.n",
+            (day, total, total, total / n if n else None, points[-1][1], n))
+        counts["points"] += len(points)
+
+
+def fold_activity_summaries(summaries, db, counts):
+    """Fold data.activity_summaries into `rings` — the Move/Exercise/Stand
+    trio. Easy to overlook, and skipping it leaves `rings` frozen at the last
+    export.xml import while every push carries the current day.
+
+    HAE has no field for Move minutes (it's only meaningful in the
+    wheelchair/move-time variant of the ring), so an existing move_min is
+    preserved rather than zeroed on conflict.
+    """
+    for s in summaries:
+        day = (s.get("date") or "")[:10]
+        if not day:
+            counts["skipped"] += 1
+            continue
+        db.execute(
+            "INSERT INTO rings (day,active_kcal,exercise_min,stand_hours,move_min)"
+            " VALUES (?,?,?,?,0) ON CONFLICT(day) DO UPDATE SET"
+            " active_kcal=excluded.active_kcal,"
+            " exercise_min=excluded.exercise_min,"
+            " stand_hours=excluded.stand_hours",
+            (day, float(s.get("active_energy") or 0),
+             float(s.get("exercise_time") or 0),
+             float(s.get("stand_hours") or 0)))
+        counts["rings"] += 1
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "synchealth/1"
+
+    def log_message(self, *a):  # quiet; the log lives in server.log
+        pass
+
+    def _reply(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _authed(self):
+        got = self.headers.get("X-Health-Token", "")
+        if hmac.compare_digest(got, self.server.token):
+            return True
+        self._reply(401, {"error": "bad or missing X-Health-Token"})
+        return False
+
+    def do_POST(self):
+        if self.path.rstrip("/").split("?")[0] not in ("/health", "/api/v1/ingest"):
+            return self._reply(404, {"error": "not found"})
+        if not self._authed():
+            return
+        n = int(self.headers.get("Content-Length") or 0)
+        if n <= 0 or n > MAX_BODY:
+            return self._reply(413, {"error": f"body must be 1..{MAX_BODY} bytes"})
+        blob = self.rfile.read(n)
+        try:
+            payload = json.loads(blob)
+            assert isinstance(payload, dict)
+        except (ValueError, AssertionError):
+            return self._reply(400, {"error": "body must be a json object"})
+
+        # Land the raw payload before folding: if aggregation is wrong we can
+        # re-fold, but an unrecorded push is gone.
+        RAW.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%dT%H%M%S")
+        p = RAW / f"{stamp}-{len(blob)}.json"
+        p.write_bytes(blob)
+
+        db = sqlite3.connect(DB)
+        try:
+            counts = fold(payload, db)
+        except Exception as e:  # never lose the raw file over a fold bug
+            self.server.log(f"fold failed for {p.name}: {e!r}")
+            return self._reply(500, {"error": f"stored raw but fold failed: {e}",
+                                     "raw": p.name})
+        finally:
+            db.close()
+        self.server.log(f"ok {p.name} {counts}")
+        self._reply(200, {"ok": True, "raw": p.name, **counts})
+
+    def do_GET(self):
+        path = self.path.split("?")[0].rstrip("/")
+        if path == "/health/summary":
+            if not self._authed():
+                return
+            days = 7
+            if "?" in self.path:
+                for kv in self.path.split("?", 1)[1].split("&"):
+                    if kv.startswith("days="):
+                        try: days = max(1, min(90, int(kv[5:])))
+                        except ValueError: pass
+            since = (date.today() - timedelta(days=days)).isoformat()
+            db = sqlite3.connect(DB)
+            try:
+                # PRIVATE_TYPES are excluded from the digest even though the
+                # push path never writes them to `daily`: an older import may
+                # have, and this endpoint enumerates whatever metrics it finds.
+                rows = db.execute(
+                    "SELECT day,metric,round(value,2) FROM daily WHERE day>=?"
+                    f" AND metric NOT IN ({','.join('?' * len(PRIVATE_TYPES))})"
+                    " ORDER BY day DESC, metric",
+                    (since, *sorted(PRIVATE_TYPES))).fetchall()
+                sleep = db.execute(
+                    "SELECT night,basis,hours FROM sleep_nights WHERE night>=?"
+                    " ORDER BY night DESC", (since,)).fetchall()
+            finally:
+                db.close()
+            out = {}
+            for day, metric, v in rows:
+                out.setdefault(day, {})[metric] = v
+            return self._reply(200, {"since": since, "days": out,
+                                     "sleep": [dict(zip(("night", "basis", "hours"), s))
+                                               for s in sleep]})
+        if path == "/health/alive":  # unauthenticated liveness only, no data
+            return self._reply(200, {"ok": True})
+        self._reply(404, {"error": "not found"})
+
+
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, addr, token):
+        super().__init__(addr, Handler)
+        self.token = token
+        self.logfile = HOME / "server.log"
+
+    def log(self, msg):
+        with open(self.logfile, "a") as f:
+            f.write(f"{time.strftime('%F %T')} {msg}\n")
+
+
+def main():
+    conf = load_conf()
+    HOME.mkdir(parents=True, exist_ok=True)
+    if not DB.exists():
+        sys.exit(f"{DB} not found — run synchealth-import on an export.xml first "
+                 "so the schema and history exist")
+    bind = conf.get("bind", "127.0.0.1")
+    port = int(conf.get("port", 8738))
+    srv = Server((bind, port), conf["token"])
+    srv.log(f"listening on {bind}:{port}")
+    print(f"synchealth-server on {bind}:{port} -> {DB}")
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Keeps the push receiver running. Only useful on a machine that is always on,
+  and only after ~/.synchealth/server.json holds a token.
+  Replace __HOME__ with your home directory, then:
+
+    cp com.synchealth.server.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.synchealth.server.plist
+
+  KeepAlive restarts it if it dies; it binds loopback by default, so nothing is
+  exposed until you point a tunnel at it.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.synchealth.server</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>__HOME__/.local/bin/synchealth-server</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>__HOME__/.synchealth/server.out</string>
+  <key>StandardErrorPath</key><string>__HOME__/.synchealth/server.err</string>
+</dict>
+</plist>

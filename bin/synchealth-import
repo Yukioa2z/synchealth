@@ -1,0 +1,397 @@
+#!/usr/bin/env python3
+"""synchealth-import — folds an Apple Health export.xml into health.db.
+
+Apple's export is the one complete source of truth for HealthKit data (the
+Health app writes it on demand; a decade of records runs a few hundred MB and
+around a million Record elements). It is NOT the ongoing pipeline — that is
+synchealth-server receiving pushes from the phone. This importer exists for two
+jobs:
+
+  1. one-time historical backfill (years the push pipeline never saw)
+  2. repair pass — whenever the push link had a hole (phone offline, iOS killed
+     the background task), re-export and re-run; writes are idempotent
+
+Storage: $SYNCHEALTH_HOME/health.db, one row per (day, metric). A million raw
+records collapse to a few thousand days x a few dozen metrics — small enough to
+query straight from an LLM turn, which is the whole point of the schema.
+
+Aggregation is per-metric BY DESIGN: steps sum over the day, heart rate
+averages, sleep sums interval durations, weight takes the last reading.
+A single SUM would turn heart rate into thousands. `daily` keeps sum/avg/min/
+max/n for every metric so the reader picks the meaning, and `stat` records
+which one is canonical.
+
+Device names are NOT normalised. One phone commonly appears under several
+sourceName values, because renaming a device does not rewrite old samples.
+Dedupe is by (metric, start, end, value) so a record synced under two names
+collapses, but sourceName is preserved verbatim in `sources` for auditing.
+
+Usage:
+  synchealth-import <path-to-export.xml> [--db PATH]
+"""
+import argparse
+import os
+import sqlite3
+import sys
+import xml.etree.ElementTree as ET
+from collections import defaultdict
+
+HOME = os.path.expanduser(os.environ.get("SYNCHEALTH_HOME", "~/.synchealth"))
+DEFAULT_DB = os.path.join(HOME, "health.db")
+
+# How to read each metric's daily value. Anything not listed defaults to
+# "avg" (a point-in-time measurement) — safe, since `daily` stores all
+# aggregates and this only sets the canonical one.
+CANONICAL = {
+    "StepCount": "sum",
+    "DistanceWalkingRunning": "sum",
+    "DistanceCycling": "sum",
+    "FlightsClimbed": "sum",
+    "ActiveEnergyBurned": "sum",
+    "BasalEnergyBurned": "sum",
+    "AppleExerciseTime": "sum",
+    "AppleStandTime": "sum",
+    "TimeInDaylight": "sum",
+    "SwimmingStrokeCount": "sum",
+    "AppleStandHour": "sum",
+    "AudioExposureEvent": "sum",
+    "BodyMass": "last",
+    "BodyMassIndex": "last",
+    "BodyFatPercentage": "last",
+    "LeanBodyMass": "last",
+    "Height": "last",
+    "RestingHeartRate": "avg",
+    "HeartRate": "avg",
+    "HeartRateVariabilitySDNN": "avg",
+    "OxygenSaturation": "avg",
+    "RespiratoryRate": "avg",
+    "VO2Max": "avg",
+}
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS daily (
+  day    TEXT NOT NULL,          -- YYYY-MM-DD, local time of the record start
+  metric TEXT NOT NULL,          -- HK identifier minus the prefix, e.g. StepCount
+  unit   TEXT,
+  stat   TEXT,                   -- which aggregate is canonical: sum/avg/last
+  value  REAL,                   -- the canonical value, for one-column reads
+  sum    REAL, avg REAL, min REAL, max REAL, last REAL,
+  n      INTEGER,                -- records behind the aggregate
+  PRIMARY KEY (day, metric)
+);
+CREATE INDEX IF NOT EXISTS daily_metric_day ON daily(metric, day);
+
+-- Sleep is intervals, not samples: a night is many rows spanning midnight.
+-- Attributed to the day the *night* starts (an 02:00 sleep start belongs to
+-- the previous evening), which is what "how did I sleep Tuesday" means.
+--
+-- Two generations of state vocabulary exist and they do NOT mix. Third-party
+-- trackers and pre-watchOS-9 records emit only `InBed`; newer Apple Watch
+-- records emit `Asleep*`/`Awake`. Summing only Asleep* silently reports 0h for
+-- every year covered by the older vocabulary — use the sleep_nights view,
+-- which falls back to InBed when no Asleep* row exists.
+CREATE TABLE IF NOT EXISTS sleep (
+  night   TEXT NOT NULL,         -- YYYY-MM-DD of the evening the sleep began
+  state   TEXT NOT NULL,         -- AsleepUnspecified/AsleepCore/REM/Awake/InBed
+  kind    TEXT NOT NULL DEFAULT 'night',  -- 'night' or 'nap' (10:00-18:00 start)
+  minutes REAL,
+  n       INTEGER,
+  PRIMARY KEY (night, state, kind)
+);
+
+-- One row per night with a single comparable duration across both
+-- generations. `basis` says which vocabulary produced it, because InBed
+-- overstates actual sleep (time in bed includes lying awake).
+-- `suspect` flags physically implausible nights: third-party apps have been
+-- observed writing single sleep records over 24 hours long.
+-- Three vocabularies can coexist for one night and must NOT be summed:
+-- AsleepUnspecified is the *same* sleep the staged rows (Core/Deep/REM) break
+-- down, so adding both double-counts (a 7.2h night reads as 9.33h).
+-- Precedence is staged > unspecified > inbed, and `basis` says which won.
+-- Naps are excluded. A watch catches afternoon naps far more reliably than it
+-- catches actual nights, so a view that mixed them would report a 2h nap as
+-- that night's total — a severe deficit on paper when the real fact is that
+-- the night went unrecorded. Query the `sleep` table with kind='nap' when you
+-- want naps.
+CREATE VIEW IF NOT EXISTS sleep_nights AS
+SELECT night,
+       CASE
+         WHEN SUM(CASE WHEN state IN ('AsleepCore','AsleepDeep','AsleepREM')
+                       THEN minutes END) IS NOT NULL THEN 'staged'
+         WHEN SUM(CASE WHEN state = 'AsleepUnspecified' THEN minutes END)
+              IS NOT NULL THEN 'asleep'
+         ELSE 'inbed' END AS basis,
+       ROUND(COALESCE(
+         SUM(CASE WHEN state IN ('AsleepCore','AsleepDeep','AsleepREM')
+                  THEN minutes END),
+         SUM(CASE WHEN state = 'AsleepUnspecified' THEN minutes END),
+         SUM(CASE WHEN state = 'InBed' THEN minutes END)) / 60.0, 2) AS hours,
+       ROUND(SUM(CASE WHEN state = 'Awake' THEN minutes END) / 60.0, 2) AS awake_hours,
+       CASE WHEN COALESCE(
+         SUM(CASE WHEN state IN ('AsleepCore','AsleepDeep','AsleepREM')
+                  THEN minutes END),
+         SUM(CASE WHEN state = 'AsleepUnspecified' THEN minutes END),
+         SUM(CASE WHEN state = 'InBed' THEN minutes END)) > 960
+       THEN 1 ELSE 0 END AS suspect
+FROM sleep WHERE kind = 'night' GROUP BY night;
+
+-- Naps as their own series, since "did I nap today" is a real question and the
+-- data answers it better than it answers "how did I sleep last night".
+CREATE VIEW IF NOT EXISTS sleep_naps AS
+SELECT night AS day,
+       ROUND(SUM(CASE WHEN state LIKE 'Asleep%' OR state = 'InBed'
+                      THEN minutes END) / 60.0, 2) AS hours
+FROM sleep WHERE kind = 'nap' GROUP BY night;
+
+CREATE TABLE IF NOT EXISTS workouts (
+  start    TEXT PRIMARY KEY,
+  end      TEXT,
+  activity TEXT,                 -- HKWorkoutActivityType* minus the prefix
+  minutes  REAL,
+  source   TEXT
+);
+
+-- Apple's own daily ring totals. NOT merely a cross-check: for older days the
+-- export drops individual Records but keeps the ring summary, so `rings` is
+-- the MORE complete source going back in time. On one real 11-year export,
+-- across 352 days with ring>50kcal, only 107 agreed with the aggregate within
+-- 5% and the mean divergence was 42.8% — the worst day had a 794kcal ring
+-- against 189kcal of Records that stopped dead at 14:00.
+-- Prefer rings for historical daily energy/exercise/stand; prefer `daily` for
+-- recent days and for anything rings does not carry.
+CREATE TABLE IF NOT EXISTS rings (
+  day           TEXT PRIMARY KEY,
+  active_kcal   REAL,
+  exercise_min  REAL,
+  stand_hours   REAL,
+  move_min      REAL
+);
+
+CREATE TABLE IF NOT EXISTS sources (
+  metric TEXT NOT NULL,
+  source TEXT NOT NULL,          -- sourceName verbatim; devices renamed over time
+  n      INTEGER,
+  PRIMARY KEY (metric, source)
+);
+
+CREATE TABLE IF NOT EXISTS imports (
+  at    TEXT,
+  path  TEXT,
+  records INTEGER,
+  days    INTEGER
+);
+"""
+
+SLEEP_PREFIX = "HKCategoryValueSleepAnalysis"
+
+# Apple stores unit='%' metrics as 0-1 fractions: blood oxygen 0.91 means 91%,
+# body fat 0.171 means 17.1%. Faithful to HealthKit but a trap for any reader
+# that takes the unit at face value ("oxygen saturation 0.98%" reads as fatal),
+# so scale to real percent at import and record the unit as such.
+PERCENT_METRICS = {
+    "OxygenSaturation", "BodyFatPercentage", "AppleWalkingSteadiness",
+    "WalkingAsymmetryPercentage", "WalkingDoubleSupportPercentage",
+}
+
+# Category types kept out of `daily` entirely, mirroring synchealth-server's
+# PRIVATE_TYPES. `daily` is the shared read surface that summaries enumerate, so
+# a row there is a row in every digest. These land in `private_events` instead:
+# queryable on request, absent from every automatic report.
+PRIVATE_TYPES = {"SexualActivity"}
+
+PRIVATE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS private_events (
+  id    TEXT PRIMARY KEY,        -- HK sample id, or start|type when absent
+  type  TEXT NOT NULL,
+  day   TEXT NOT NULL,
+  at    TEXT,
+  minutes REAL,
+  value_label TEXT,
+  source TEXT
+);
+"""
+
+
+def day_of(stamp):
+    """'2026-07-25 14:42:28 +0800' -> '2026-07-25'. Apple stamps are already
+    local time, so no conversion is needed (and none is wanted — 'which day
+    did I walk' is a local-calendar question)."""
+    return stamp[:10] if stamp else None
+
+
+def minutes_between(start, end):
+    """Interval length in minutes. Hand-rolled because the only format Apple
+    emits is fixed-width, and this avoids a datetime parse per record on a
+    million-record file."""
+    def secs(s):
+        h, m, sec = int(s[11:13]), int(s[14:16]), int(s[17:19])
+        return h * 3600 + m * 60 + sec
+    d1, d2 = start[:10], end[:10]
+    delta = secs(end) - secs(start)
+    if d2 != d1:  # crosses midnight — count the day boundary once per day
+        import datetime
+        days = (datetime.date(int(d2[:4]), int(d2[5:7]), int(d2[8:10])) -
+                datetime.date(int(d1[:4]), int(d1[5:7]), int(d1[8:10]))).days
+        delta += days * 86400
+    return delta / 60.0
+
+
+def sleep_night(start):
+    """Which night a sleep segment belongs to, and whether it is a nap.
+
+    Returns (night, kind) where kind is 'night' or 'nap'. The distinction is
+    not cosmetic: watch-recorded sleep starts cluster in the early afternoon,
+    because the watch catches naps far more often than it catches actual
+    nights. Folding a 2h nap into "time asleep" then reports it as a severe
+    sleep deficit, when the truth is that the night simply was not recorded.
+    A nap is any segment starting between 10:00 and 18:00.
+    """
+    import datetime
+    hour = int(start[11:13])
+    d = datetime.date(int(start[:4]), int(start[5:7]), int(start[8:10]))
+    if 10 <= hour < 18:
+        return d.isoformat(), "nap"
+    if hour < 10:  # after-midnight start: the night began yesterday evening
+        return (d - datetime.timedelta(days=1)).isoformat(), "night"
+    return d.isoformat(), "night"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("xml")
+    ap.add_argument("--db", default=DEFAULT_DB)
+    args = ap.parse_args()
+
+    os.makedirs(os.path.dirname(os.path.abspath(args.db)), exist_ok=True)
+    db = sqlite3.connect(args.db)
+    db.executescript(SCHEMA)
+    db.executescript(PRIVATE_SCHEMA)
+
+    # (day, metric) -> aggregate accumulator. Dedupe key is the identity of a
+    # measurement: the same sample synced from two renamed devices is one fact.
+    agg = defaultdict(lambda: {"unit": None, "vals": [], "last": None})
+    seen = set()
+    sleep_agg = defaultdict(lambda: {"minutes": 0.0, "n": 0})
+    src_agg = defaultdict(int)
+    workouts, rings, private = [], [], []
+    n_records = 0
+
+    for _, el in ET.iterparse(args.xml, events=("end",)):
+        if el.tag == "Record":
+            metric = el.get("type", "").split("Identifier")[-1]
+            start, end = el.get("startDate"), el.get("endDate")
+            raw = el.get("value")
+            src_agg[(metric, el.get("sourceName", "?"))] += 1
+            n_records += 1
+
+            if metric == "SleepAnalysis":
+                key = (start, end, raw)
+                if key not in seen:
+                    seen.add(key)
+                    night, kind = sleep_night(start)
+                    s = sleep_agg[(night, (raw or "").replace(SLEEP_PREFIX, "")
+                                   or "Unknown", kind)]
+                    s["minutes"] += minutes_between(start, end)
+                    s["n"] += 1
+            elif metric in PRIVATE_TYPES:
+                # Never enters `daily`. Keyed on start|type so a re-import
+                # updates rather than duplicates (export.xml carries no id).
+                key = (metric, start, end, raw)
+                if key not in seen:
+                    seen.add(key)
+                    private.append((f"{start}|{metric}", metric, day_of(start),
+                                    start, minutes_between(start, end),
+                                    (raw or ""), el.get("sourceName")))
+            else:
+                try:
+                    v = float(raw)
+                except (TypeError, ValueError):
+                    # category records without a numeric value (MenstrualFlow,
+                    # AppleStandHour): presence is the datum
+                    v = 1.0
+                key = (metric, start, end, raw)
+                if key not in seen:
+                    seen.add(key)
+                    if metric in PERCENT_METRICS:
+                        v *= 100.0
+                    a = agg[(day_of(start), metric)]
+                    a["unit"] = a["unit"] or el.get("unit")
+                    a["vals"].append(v)
+                    a["last"] = v
+        elif el.tag == "Workout":
+            workouts.append((
+                el.get("startDate"), el.get("endDate"),
+                el.get("workoutActivityType", "").replace("HKWorkoutActivityType", ""),
+                float(el.get("duration") or 0), el.get("sourceName")))
+        elif el.tag == "ActivitySummary":
+            rings.append((
+                el.get("dateComponents"),
+                float(el.get("activeEnergyBurned") or 0),
+                float(el.get("appleExerciseTime") or 0),
+                float(el.get("appleStandHours") or 0),
+                float(el.get("appleMoveTime") or 0)))
+        el.clear()
+
+    rows = []
+    for (day, metric), a in agg.items():
+        if not day or not a["vals"]:
+            continue
+        vals = a["vals"]
+        total, avg = sum(vals), sum(vals) / len(vals)
+        stat = CANONICAL.get(metric, "avg")
+        canon = {"sum": total, "avg": avg, "last": a["last"]}[stat]
+        rows.append((day, metric, a["unit"], stat, canon,
+                     total, avg, min(vals), max(vals), a["last"], len(vals)))
+
+    with db:
+        db.executemany(
+            "INSERT INTO daily (day,metric,unit,stat,value,sum,avg,min,max,last,n)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(day,metric) DO UPDATE SET"
+            " unit=excluded.unit, stat=excluded.stat, value=excluded.value,"
+            " sum=excluded.sum, avg=excluded.avg, min=excluded.min,"
+            " max=excluded.max, last=excluded.last, n=excluded.n", rows)
+        db.executemany(
+            "INSERT INTO sleep (night,state,kind,minutes,n) VALUES (?,?,?,?,?)"
+            " ON CONFLICT(night,state,kind) DO UPDATE SET"
+            " minutes=excluded.minutes, n=excluded.n",
+            [(k[0], k[1], k[2], v["minutes"], v["n"]) for k, v in sleep_agg.items()])
+        db.executemany(
+            "INSERT INTO workouts (start,end,activity,minutes,source)"
+            " VALUES (?,?,?,?,?) ON CONFLICT(start) DO UPDATE SET"
+            " end=excluded.end, activity=excluded.activity,"
+            " minutes=excluded.minutes, source=excluded.source", workouts)
+        db.executemany(
+            "INSERT INTO rings (day,active_kcal,exercise_min,stand_hours,move_min)"
+            " VALUES (?,?,?,?,?) ON CONFLICT(day) DO UPDATE SET"
+            " active_kcal=excluded.active_kcal, exercise_min=excluded.exercise_min,"
+            " stand_hours=excluded.stand_hours, move_min=excluded.move_min", rings)
+        db.executemany(
+            "INSERT INTO private_events (id,type,day,at,minutes,value_label,source)"
+            " VALUES (?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET"
+            " day=excluded.day, at=excluded.at, minutes=excluded.minutes,"
+            " value_label=excluded.value_label, source=excluded.source", private)
+        db.executemany(
+            "INSERT INTO sources (metric,source,n) VALUES (?,?,?)"
+            " ON CONFLICT(metric,source) DO UPDATE SET n=excluded.n",
+            [(k[0], k[1], v) for k, v in src_agg.items()])
+        db.execute(
+            "INSERT INTO imports (at,path,records,days) VALUES"
+            " (datetime('now','localtime'),?,?,?)",
+            (os.path.abspath(args.xml), n_records, len(set(r[0] for r in rows))))
+
+    days = db.execute("SELECT count(DISTINCT day) FROM daily").fetchone()[0]
+    print(f"records read : {n_records:,}")
+    print(f"daily rows   : {len(rows):,} across {days:,} days")
+    print(f"sleep nights : {len(set(k[0] for k in sleep_agg if k[2] == 'night')):,}"
+          f"  (+{len(set(k[0] for k in sleep_agg if k[2] == 'nap')):,} nap days)")
+    print(f"workouts     : {len(workouts):,}")
+    print(f"ring days    : {len(rings):,}")
+    if private:
+        # Counted separately so the line never implies these entered `daily`.
+        print(f"private      : {len(private):,} (private_events, out of all summaries)")
+    print(f"db           : {args.db}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

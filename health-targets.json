@@ -1,0 +1,155 @@
+{
+  "_readme": "Reference ranges and personal goals for `health` (the CLI view over health.db). Two different things, deliberately separate: `ref` is a clinical normal range — not a choice, it comes from published guidance — while `goal` is a value judgement about where you want to be, which no amount of data can derive. A metric can sit inside `ref` and still miss `goal`. Edit `goal` freely; changing `ref` means disagreeing with the cited source. Direction: 'higher' = more is better, 'lower' = less is better, 'band' = stay inside the range. Seeded from standard adult guidance; every entry cites where the number came from so a future reader can check it rather than trust it. These defaults assume a healthy adult — read each `why` before relying on one.",
+
+  "metrics": {
+    "RestingHeartRate": {
+      "label": "Resting HR",
+      "direction": "lower",
+      "ref": [40, 100],
+      "goal_max": 60,
+      "why": "AHA calls 60-100 bpm normal for adults; athletes commonly 40-60. Sub-60 at rest is a fitness marker, so the goal is stricter than the clinical floor."
+    },
+    "HeartRate": {
+      "label": "Heart rate (all-day avg)",
+      "direction": "lower",
+      "ref": [50, 110],
+      "why": "All-day average mixes rest and activity, so no clinical range applies directly. Wide band flags only data problems or sustained tachycardia — read RestingHeartRate for signal."
+    },
+    "HeartRateVariabilitySDNN": {
+      "label": "HRV (SDNN)",
+      "direction": "higher",
+      "ref": [20, 200],
+      "goal_min": 50,
+      "why": "SDNN is strongly age- and individual-dependent; absolute cutoffs are weak evidence. Population studies put healthy adult overnight SDNN around 40-100ms. Treat your own trend as the signal, not the number."
+    },
+    "OxygenSaturation": {
+      "label": "Blood oxygen (SpO2)",
+      "direction": "higher",
+      "ref": [95, 100],
+      "goal_min": 95,
+      "why": "95-100% is the standard normal for healthy adults at sea level; below 95 warrants attention, below 90 is hypoxemia. Wrist sensors read low on cold or poorly-perfused skin, so a single low value is usually artifact."
+    },
+    "RespiratoryRate": {
+      "label": "Respiratory rate",
+      "direction": "band",
+      "ref": [12, 20],
+      "why": "12-20 breaths/min is the standard adult resting range. Sleep values run at or slightly below the low end."
+    },
+    "StepCount": {
+      "label": "Daily steps",
+      "direction": "higher",
+      "ref": [0, 100000],
+      "goal_min": 8000,
+      "why": "Mortality benefit rises steeply to ~8000 steps/day and plateaus near 10000 (Paluch 2021, JAMA Netw Open). 8000 is where the curve flattens, so it is the honest target; 10000 was a 1960s pedometer slogan."
+    },
+    "AppleExerciseTime": {
+      "label": "Exercise minutes",
+      "direction": "higher",
+      "ref": [0, 600],
+      "goal_min": 21,
+      "why": "WHO recommends 150 min/week of moderate activity = ~21 min/day. The daily framing is a convenience; the weekly total is what the guidance actually says."
+    },
+    "AppleStandHour": {
+      "label": "Stand hours",
+      "direction": "higher",
+      "ref": [0, 24],
+      "goal_min": 12,
+      "why": "No clinical guideline exists; 12 is Apple's own default ring target and a reasonable proxy for breaking up sedentary time."
+    },
+    "TimeInDaylight": {
+      "label": "Daylight",
+      "direction": "higher",
+      "ref": [0, 1440],
+      "goal_min": 120,
+      "why": "Observational work links >2h/day outdoor light to better mood, sleep timing and myopia outcomes. Weaker evidence than the cardio numbers; treat as directional."
+    },
+    "DistanceWalkingRunning": {
+      "label": "Walk+run distance",
+      "direction": "higher",
+      "ref": [0, 100],
+      "goal_min": 5,
+      "why": "Roughly the distance implied by the 8000-step goal at an average adult step length (~65cm). Derived from the step goal, not independent guidance — recompute from your own WalkingStepLength if you care about the number."
+    },
+    "SleepHours": {
+      "label": "Time asleep",
+      "direction": "higher",
+      "ref": [6, 10],
+      "goal_min": 7,
+      "min_days": 30,
+      "why": "AASM/Sleep Research Society consensus: 7+ hours per night for adults. `min_days` suppresses a verdict until 30 nights exist in the last 90 days, because sleep coverage is commonly poor: pre-watchOS-9 and third-party records log time in bed rather than sleep, and a watch that is charging overnight records nothing. Judging a night against a 7h goal from a stale fragment would invent a finding."
+    },
+    "BodyMass": {
+      "label": "Weight",
+      "direction": "band",
+      "why": "No universal target; BMI needs height and says little about composition. Tracked for trend only."
+    },
+    "BodyFatPercentage": {
+      "label": "Body fat",
+      "direction": "lower",
+      "ref": [8, 25],
+      "goal_max": 20,
+      "why": "ACE puts 'fitness' range at 14-17% and 'acceptable' at 18-24% for adult men; the corresponding bands for women run roughly 10 points higher. Set both ref and goal for your own body — this default is the male band."
+    },
+    "VO2Max": {
+      "label": "VO2 max",
+      "direction": "higher",
+      "ref": [30, 60],
+      "goal_min": 45,
+      "why": "Cooper Institute norms put 'good' for men 30-49 near 45 mL/kg/min; women's norms run about 8-10 mL/kg/min lower at the same age. One of the strongest single predictors of all-cause mortality, so worth a goal even on sparse data."
+    },
+    "WalkingHeartRateAverage": {
+      "label": "Walking HR",
+      "direction": "lower",
+      "ref": [70, 130],
+      "why": "No clinical cutoff. A falling walking HR at constant pace is an aerobic-fitness signal, which is why it is tracked at all."
+    },
+    "AppleWalkingSteadiness": {
+      "label": "Walking steadiness",
+      "direction": "higher",
+      "ref": [50, 100],
+      "goal_min": 90,
+      "why": "Apple's own bands: OK >=50%, Low 25-50%, Very Low <25%. Only meaningful as a fall-risk screen in older adults."
+    },
+    "HeadphoneAudioExposure": {
+      "label": "Headphone audio",
+      "direction": "lower",
+      "ref": [0, 80],
+      "goal_max": 75,
+      "why": "WHO safe-listening: 80 dB for 40h/week for adults. Sustained exposure above that accumulates hearing damage."
+    },
+    "EnvironmentalAudioExposure": {
+      "label": "Environment audio",
+      "direction": "lower",
+      "ref": [0, 80],
+      "why": "Same WHO 80 dB basis as headphone exposure, applied to ambient sound."
+    },
+    "FlightsClimbed": {
+      "label": "Flights climbed",
+      "direction": "higher",
+      "ref": [0, 200],
+      "why": "No guideline. Kept as a proxy for incidental vertical activity."
+    },
+    "ActiveEnergyBurned": {
+      "label": "Active energy",
+      "direction": "higher",
+      "ref": [0, 3000],
+      "why": "Depends entirely on body mass and activity type; no population target is meaningful. Trend only."
+    },
+    "BasalEnergyBurned": {
+      "label": "Basal energy",
+      "direction": "band",
+      "why": "A device estimate from body metrics, not a measurement. Useful only to notice sudden discontinuities."
+    }
+  },
+
+  "systems": {
+    "_readme": "Groups for the coverage matrix — which parts of the picture have data in which year. Grouping by body system makes gaps visible instead of leaving them implied by absence.",
+    "Activity": ["StepCount", "DistanceWalkingRunning", "FlightsClimbed", "AppleExerciseTime", "AppleStandHour", "ActiveEnergyBurned", "DistanceCycling"],
+    "Cardio": ["RestingHeartRate", "HeartRate", "HeartRateVariabilitySDNN", "WalkingHeartRateAverage", "VO2Max"],
+    "Respiratory": ["OxygenSaturation", "RespiratoryRate"],
+    "Sleep": ["SleepHours"],
+    "Body": ["BodyMass", "BodyMassIndex", "BodyFatPercentage", "LeanBodyMass", "Height"],
+    "Mobility": ["WalkingSpeed", "WalkingStepLength", "WalkingAsymmetryPercentage", "WalkingDoubleSupportPercentage", "AppleWalkingSteadiness", "StairAscentSpeed", "StairDescentSpeed"],
+    "Environment": ["HeadphoneAudioExposure", "EnvironmentalAudioExposure", "TimeInDaylight"]
+  }
+}

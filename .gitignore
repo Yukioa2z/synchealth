@@ -1,0 +1,10 @@
+# Never commit health data or the token. health.db is a complete medical record.
+*.db
+*.db-wal
+*.db-shm
+server.json
+raw/
+archive/
+*.log
+__pycache__/
+.DS_Store

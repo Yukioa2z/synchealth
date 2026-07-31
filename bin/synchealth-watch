@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""synchealth-watch — turn a dropped Apple Health export into a live health.db.
+
+Apple gives no API and no automation hook for exporting HealthKit: the Health
+app's "Export All Health Data" is four manual taps, and it cannot be driven from
+Shortcuts. So this does not try to automate the export — it automates everything
+after it.
+
+You: Health app -> profile -> Export All Health Data -> save to a watch dir.
+This: unzip, import, archive the xml gzipped, delete the zip, log one line.
+
+Run from launchd every 15 minutes, or by hand. Silent when there is nothing to
+do (cron convention). Watch dirs are tried in order, so iCloud Drive works if
+the export is saved there and ~/Downloads works if it is saved locally.
+
+Config (all optional, via environment):
+  SYNCHEALTH_HOME   where health.db, archive/ and watch.log live
+                    (default ~/.synchealth)
+  SYNCHEALTH_WATCH  colon-separated dirs to scan for export zips; overrides the
+                    defaults below
+  SYNCHEALTH_IMPORT path to synchealth-import (default: found on PATH, then
+                    alongside this script)
+"""
+import gzip
+import os
+import shutil
+import subprocess
+import sys
+import time
+import zipfile
+from datetime import datetime
+from pathlib import Path
+
+HOME = Path(os.path.expanduser(os.environ.get("SYNCHEALTH_HOME", "~/.synchealth")))
+ARCHIVE = HOME / "archive"
+LOG = HOME / "watch.log"
+
+DEFAULT_WATCH_DIRS = [
+    Path.home() / "Library/Mobile Documents/com~apple~CloudDocs/HealthExports",
+    Path.home() / "Downloads",
+]
+# Apple names the file export.zip; a second save becomes "export 2.zip" etc.
+PATTERNS = ("export*.zip", "apple_health_export*.zip")
+
+# A zip still being written or synced from iCloud must not be opened. Two
+# size samples a few seconds apart is cruder than watching filesystem events
+# but has no failure mode that leaves a half-file imported.
+SETTLE_SECS = 6
+
+
+def watch_dirs():
+    env = os.environ.get("SYNCHEALTH_WATCH")
+    if env:
+        return [Path(os.path.expanduser(p)) for p in env.split(":") if p]
+    return DEFAULT_WATCH_DIRS
+
+
+def importer():
+    """Locate synchealth-import: explicit env, then PATH, then this script's own
+    directory (the layout in a freshly cloned repo)."""
+    env = os.environ.get("SYNCHEALTH_IMPORT")
+    if env:
+        return Path(os.path.expanduser(env))
+    found = shutil.which("synchealth-import")
+    if found:
+        return Path(found)
+    return Path(__file__).resolve().parent / "synchealth-import"
+
+
+def log(msg):
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    line = f"{time.strftime('%F %T')} {msg}"
+    with open(LOG, "a") as f:
+        f.write(line + "\n")
+    print(line)
+
+
+def find_exports():
+    seen, out = set(), []
+    for d in watch_dirs():
+        if not d.is_dir():
+            continue
+        for pat in PATTERNS:
+            for p in sorted(d.glob(pat)):
+                if p.is_file() and p.resolve() not in seen:
+                    seen.add(p.resolve())
+                    out.append(p)
+    return out
+
+
+def settled(p):
+    try:
+        a = p.stat().st_size
+        time.sleep(SETTLE_SECS)
+        return a == p.stat().st_size and a > 0
+    except OSError:
+        return False
+
+
+def extract_xml(zip_path, dest_dir):
+    """Pull export.xml out of the zip. Apple nests it under a folder, and the
+    zip also carries workout-routes and ECG files we do not need here."""
+    with zipfile.ZipFile(zip_path) as z:
+        names = [n for n in z.namelist()
+                 if n.endswith("/export.xml") or n == "export.xml"]
+        if not names:
+            return None
+        # The shortest path is the real one; some exports also contain
+        # export_cda.xml and nested copies.
+        target = min(names, key=len)
+        out = dest_dir / "export.xml"
+        with z.open(target) as src, open(out, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+        return out
+
+
+def archive(xml_path):
+    """Keep the raw export, gzipped (roughly 25:1). It is the only complete
+    source of truth: the importer's aggregation can be rebuilt from it, but a
+    deleted export is gone, and Apple will not reissue an old one."""
+    ARCHIVE.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+    dest = ARCHIVE / f"export-{stamp}.xml.gz"
+    with open(xml_path, "rb") as src, gzip.open(dest, "wb", compresslevel=6) as dst:
+        shutil.copyfileobj(src, dst, length=8 << 20)
+    return dest
+
+
+def process(zip_path, imp):
+    log(f"found {zip_path}")
+    if not settled(zip_path):
+        log("  still being written or empty — leaving for next run")
+        return False
+
+    work = HOME / "incoming"
+    if work.exists():
+        shutil.rmtree(work)
+    work.mkdir(parents=True)
+    try:
+        xml = extract_xml(zip_path, work)
+        if not xml:
+            log("  no export.xml inside — not an Apple Health export, skipped")
+            return False
+        mb = xml.stat().st_size / 1e6
+        log(f"  extracted export.xml ({mb:.0f}MB)")
+
+        # Prefer /usr/bin/python3 over sys.executable: some Homebrew Python
+        # builds ship a pyexpat linked against a mismatched system libexpat, and
+        # ElementTree then cannot parse anything at all. The importer needs only
+        # the standard library, and the system interpreter always has a working
+        # expat.
+        py = "/usr/bin/python3" if Path("/usr/bin/python3").exists() else sys.executable
+        r = subprocess.run([py, str(imp), str(xml)],
+                           capture_output=True, text=True, timeout=1800)
+        if r.returncode != 0:
+            # Leave the zip in place: a failed import must be retryable, and
+            # the next run will find it again.
+            log(f"  import FAILED rc={r.returncode}: {r.stderr.strip()[:300]}")
+            return False
+        for line in r.stdout.strip().splitlines():
+            log(f"  {line}")
+
+        gz = archive(xml)
+        log(f"  archived {gz.name} ({gz.stat().st_size/1e6:.0f}MB)")
+        zip_path.unlink()
+        log(f"  removed {zip_path.name} — done")
+        return True
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def main():
+    imp = importer()
+    if not imp.exists():
+        sys.exit(f"{imp} not found — install synchealth-import or set "
+                 "SYNCHEALTH_IMPORT")
+    exports = find_exports()
+    if not exports:
+        return 0            # silence = nothing dropped
+    ok = sum(process(p, imp) for p in exports)
+    log(f"processed {ok}/{len(exports)} export(s)")
+    return 0 if ok == len(exports) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

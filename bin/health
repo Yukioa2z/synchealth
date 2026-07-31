@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+"""health — read health.db the way a person actually asks about it.
+
+A raw number answers nothing. "Resting HR 61" only becomes useful next to the
+normal range, your own goal, and which way it has been moving.
+
+Ranges live in health-targets.json, split into `ref` (clinical normal, cited,
+not a preference) and `goal` (a value judgement, yours to change). A value can
+be inside `ref` and still miss `goal`; conflating the two would quietly turn
+published guidance into personal opinion.
+
+  health              latest value per metric, with ref/goal/trend
+  health goals        only the metrics that carry a goal
+  health <metric>     one metric's recent history
+  health coverage     which systems have data in which year
+  health brief        compact text digest, for an agent to read
+
+Everything reads a single sqlite file, so an agent can call this or query the
+db directly — see docs/health-db.md for the traps in the raw tables.
+
+Config: SYNCHEALTH_HOME (default ~/.synchealth) holds health.db and, optionally,
+health-targets.json. A copy next to this script wins, so an edit in a checkout
+takes effect without installing.
+"""
+import argparse
+import json
+import os
+import sqlite3
+import sys
+from datetime import date, timedelta
+from pathlib import Path
+
+HOME = Path(os.path.expanduser(os.environ.get("SYNCHEALTH_HOME", "~/.synchealth")))
+DB = HOME / "health.db"
+# Checkout copy first so an edit is picked up without installing; SYNCHEALTH_HOME
+# is the installed location.
+TARGETS = [Path(__file__).resolve().parent.parent / "health-targets.json",
+           HOME / "health-targets.json"]
+
+# Trend needs enough days to mean something, but not so many that a real change
+# is averaged away. 30 vs the preceding 120 is a compromise, and small deltas are
+# reported as flat rather than as noise-driven arrows.
+RECENT_DAYS, BASELINE_DAYS = 30, 120
+FLAT_PCT = 3.0
+
+C = {"ok": "\033[32m", "warn": "\033[33m", "bad": "\033[31m",
+     "dim": "\033[2m", "b": "\033[1m", "off": "\033[0m"}
+
+
+def paint(s, k):
+    return f"{C[k]}{s}{C['off']}" if sys.stdout.isatty() else s
+
+
+def load_targets():
+    for p in TARGETS:
+        if p.exists():
+            return json.loads(p.read_text())
+    sys.exit(f"no health-targets.json found (looked in {', '.join(map(str, TARGETS))})")
+
+
+def connect():
+    if not DB.exists():
+        sys.exit(f"{DB} not found — run synchealth-import on an export.xml first")
+    con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def sleep_rows(con):
+    """Sleep lives in its own table with its own vocabulary; present it as one
+    more metric named SleepHours so callers don't need to know that."""
+    try:
+        return [(r["night"], r["hours"]) for r in con.execute(
+            "SELECT night, hours FROM sleep_nights WHERE suspect = 0"
+            " AND hours IS NOT NULL ORDER BY night")]
+    except sqlite3.Error:
+        return []
+
+
+def last_partial_day(con):
+    """First day to exclude from cumulative metrics.
+
+    The newest day in an export is always partial: the export captures the
+    moment the button was pressed, so an export taken at lunchtime holds a
+    fraction of the day's steps. Dropping that day unconditionally costs one day
+    of a multi-year series and removes a whole class of false "below goal"
+    readings.
+
+    Two cleverer attempts fail. Comparing the import timestamp to the newest day
+    breaks on re-import, since importing an old export makes them disagree.
+    Detecting a thin sample count breaks because this data is not regular enough
+    to have a norm — consecutive days can hold 398, 18 and 8 samples.
+    """
+    newest = con.execute("SELECT max(day) FROM daily").fetchone()[0]
+    today = date.today().isoformat()
+    return min(newest, today) if newest else today
+
+
+def series(con, metric):
+    if metric == "SleepHours":
+        return sleep_rows(con)
+    return [(r["day"], r["value"]) for r in con.execute(
+        "SELECT day, value FROM daily WHERE metric = ? AND value IS NOT NULL"
+        " ORDER BY day", (metric,))]
+
+
+def verdict(value, spec):
+    """(status, note) for one value. `goal` is checked before `ref` because a
+    value can clear the clinical range and still miss the target — reporting
+    only 'in range' there would hide the thing you actually care about."""
+    ref, direction = spec.get("ref"), spec.get("direction", "band")
+    gmin, gmax = spec.get("goal_min"), spec.get("goal_max")
+    if ref:
+        lo, hi = ref
+        if value < lo:
+            return "bad", "low"
+        if value > hi:
+            return "bad", "high"
+    if gmin is not None and value < gmin:
+        return "warn", f"below goal {gmin:g}"
+    if gmax is not None and value > gmax:
+        return "warn", f"above goal {gmax:g}"
+    if gmin is not None or gmax is not None:
+        return "ok", "at goal"
+    return "ok", "in range" if ref else ""
+
+
+def trend(rows):
+    """(arrow, pct) comparing the last RECENT_DAYS to the BASELINE_DAYS before
+    them. Returns flat when either window is thin — an arrow drawn from three
+    samples is a guess wearing a fact's clothes."""
+    if len(rows) < 8:
+        return "·", None
+    last_day = date.fromisoformat(rows[-1][0])
+    r_start = last_day - timedelta(days=RECENT_DAYS)
+    b_start = r_start - timedelta(days=BASELINE_DAYS)
+    recent = [v for d, v in rows if date.fromisoformat(d) > r_start]
+    base = [v for d, v in rows if b_start < date.fromisoformat(d) <= r_start]
+    if len(recent) < 3 or len(base) < 3:
+        return "·", None
+    ra, ba = sum(recent) / len(recent), sum(base) / len(base)
+    if ba == 0:
+        return "·", None
+    pct = (ra - ba) / abs(ba) * 100
+    if abs(pct) < FLAT_PCT:
+        return "→", pct
+    return ("↑" if pct > 0 else "↓"), pct
+
+
+def fmt_range(spec):
+    bits = []
+    if spec.get("ref"):
+        bits.append(f"ref {spec['ref'][0]:g}-{spec['ref'][1]:g}")
+    if spec.get("goal_min") is not None:
+        bits.append(f"goal ≥{spec['goal_min']:g}")
+    if spec.get("goal_max") is not None:
+        bits.append(f"goal ≤{spec['goal_max']:g}")
+    return " · ".join(bits)
+
+
+def units(con):
+    return {r["metric"]: r["unit"] for r in
+            con.execute("SELECT metric, max(unit) unit FROM daily GROUP BY metric")}
+
+
+def collect(con, targets, only_goals=False):
+    """Latest usable value per metric.
+
+    Partial days are skipped for anything that accumulates. The cut-off is the
+    day an export was taken, NOT today: an export at 13:04 captures only that
+    morning, so reporting that day as "below goal" describes when the button was
+    pressed, not the day. Averaged metrics (resting HR, SpO2) are unaffected and
+    keep every day.
+    """
+    out = []
+    unit_map = units(con)
+    partial = last_partial_day(con)
+    cumulative = {m for m, s in targets["metrics"].items()
+                  if s.get("direction") == "higher" or m == "SleepHours"}
+    for metric, spec in targets["metrics"].items():
+        if only_goals and spec.get("goal_min") is None and spec.get("goal_max") is None:
+            continue
+        rows = series(con, metric)
+        if metric in cumulative and partial:
+            rows = [r for r in rows if r[0] < partial]
+        if not rows:
+            continue
+        day, value = rows[-1]
+        # Some metrics need recent density before a verdict means anything, and
+        # the test has to be on RECENT days, not the lifetime count. A record can
+        # hold hundreds of nights whose newest is two years old — plenty of
+        # history, no current signal. Judging today against a stale fragment
+        # invents a finding, so say what is actually known instead.
+        need = spec.get("min_days", 0)
+        recent_n = 0
+        if need:
+            cut = (date.today() - timedelta(days=90)).isoformat()
+            recent_n = sum(1 for d, _ in rows if d >= cut)
+        if need and recent_n < need:
+            st = "ok"
+            note = (f"{recent_n}d in last 90 — too sparse to judge" if recent_n
+                    else f"no data since {day}")
+        else:
+            st, note = verdict(value, spec)
+        arrow, pct = trend(rows)
+        out.append({
+            "metric": metric, "label": spec.get("label", metric),
+            "unit": "hr" if metric == "SleepHours" else (unit_map.get(metric) or ""),
+            "value": value, "day": day, "status": st, "note": note,
+            "arrow": arrow, "pct": pct, "range": fmt_range(spec), "n": len(rows),
+        })
+    # Anything needing attention first: that is the reason to open this at all.
+    order = {"bad": 0, "warn": 1, "ok": 2}
+    out.sort(key=lambda r: (order[r["status"]], r["label"]))
+    return out
+
+
+def render(rows, show_stale=True):
+    if not rows:
+        print("no metrics with data")
+        return
+    today = date.today()
+    w = max(len(r["label"]) for r in rows)
+    uw = max(len(r["unit"]) for r in rows)
+    # Columns are padded BEFORE colouring: ANSI escapes count toward str width,
+    # so padding a painted string silently shifts every following column.
+    tw = max(len(f"{r['arrow']}{trend_pct(r)}") for r in rows)
+    nw = max(len(r["note"]) for r in rows)
+    for r in rows:
+        val = f"{r['value']:,.1f}".rstrip("0").rstrip(".")
+        age = (today - date.fromisoformat(r["day"])).days
+        stale = paint(f"   {r['day']}", "dim") if (show_stale and age > 7) else ""
+        tr = f"{r['arrow']}{trend_pct(r)}".ljust(tw)
+        note = r["note"].ljust(nw)
+        print(f"  {r['label']:<{w}}  {paint(f'{val:>9}', 'b')} {r['unit']:<{uw}}  "
+              f"{paint(tr, 'dim')}  {paint(note, r['status'])}  "
+              f"{paint(r['range'], 'dim')}{stale}")
+
+
+def trend_pct(r):
+    return f" {r['pct']:+.0f}%" if r["pct"] is not None and r["arrow"] != "→" else ""
+
+
+def cmd_now(con, targets, args):
+    rows = collect(con, targets)
+    if not rows:
+        sys.exit("no metrics with data — is health.db populated?")
+    bad = sum(r["status"] == "bad" for r in rows)
+    warn = sum(r["status"] == "warn" for r in rows)
+    newest = max(r["day"] for r in rows)
+    age = (date.today() - date.fromisoformat(newest)).days
+    head = f"{len(rows)} metrics · newest {newest}"
+    if age > 3:
+        head += paint(f" ({age}d old — re-export?)", "warn")
+    print(f"\n{paint('Health', 'b')}  {paint(head, 'dim')}")
+    print(f"  {paint(f'{bad} out of range · {warn} off goal', 'dim')}\n")
+    render(rows)
+    print()
+
+
+def cmd_goals(con, targets, args):
+    rows = collect(con, targets, only_goals=True)
+    at = sum(r["status"] == "ok" for r in rows)
+    print(f"\n{paint('Goals', 'b')}  {paint(f'{at} of {len(rows)} at target', 'dim')}\n")
+    render(rows)
+    print()
+
+
+def cmd_metric(con, targets, args):
+    name = args.name
+    keys = list(targets["metrics"])
+    match = next((k for k in keys if k.lower() == name.lower()), None) \
+        or next((k for k in keys if name.lower() in k.lower()), None)
+    if not match:
+        avail = [r["metric"] for r in con.execute(
+            "SELECT DISTINCT metric FROM daily ORDER BY metric")]
+        hit = next((m for m in avail if name.lower() in m.lower()), None)
+        if not hit:
+            sys.exit(f"unknown metric {name!r}\nknown: {', '.join(keys)}")
+        match, spec = hit, {}
+    else:
+        spec = targets["metrics"][match]
+
+    rows = series(con, match)
+    if not rows:
+        sys.exit(f"{match}: no data")
+    label = spec.get("label", match)
+    print(f"\n{paint(label, 'b')} {paint(f'({match})', 'dim')}")
+    print(f"  {len(rows)} days · {rows[0][0]} → {rows[-1][0]}")
+    if spec.get("why"):
+        print(f"  {paint(spec['why'], 'dim')}")
+    for window, days in (("30d", 30), ("90d", 90), ("365d", 365)):
+        cut = date.fromisoformat(rows[-1][0]) - timedelta(days=days)
+        vals = [v for d, v in rows if date.fromisoformat(d) > cut]
+        if vals:
+            print(f"  {window:>5}  avg {sum(vals)/len(vals):>9,.1f}"
+                  f"   min {min(vals):>8,.1f}   max {max(vals):>8,.1f}"
+                  f"   {paint(f'n={len(vals)}', 'dim')}")
+    print(f"\n  {paint('recent', 'dim')}")
+    for d, v in rows[-args.limit:]:
+        mark = ""
+        if spec:
+            st, note = verdict(v, spec)
+            mark = paint(f"  {note}", st) if note and st != "ok" else ""
+        print(f"    {d}  {v:>9,.1f}{mark}")
+    print()
+
+
+def cmd_coverage(con, targets, args):
+    """Which systems have data in which year. Absence of a row elsewhere is
+    ambiguous — it could mean healthy, or never measured. This makes the
+    difference explicit."""
+    years = [r[0] for r in con.execute(
+        "SELECT DISTINCT substr(day,1,4) FROM daily ORDER BY 1")]
+    if not years:
+        sys.exit("no data")
+    counts = {}
+    for r in con.execute("SELECT metric, substr(day,1,4) y, count(*) n"
+                         " FROM daily GROUP BY metric, y"):
+        counts[(r["metric"], r["y"])] = r["n"]
+    for night, in con.execute("SELECT substr(night,1,4) FROM sleep_nights"
+                              " WHERE suspect = 0"):
+        k = ("SleepHours", night)
+        counts[k] = counts.get(k, 0) + 1
+
+    systems = {k: v for k, v in targets["systems"].items() if not k.startswith("_")}
+    w = max(len(s) for s in systems)
+    print(f"\n{paint('Coverage', 'b')}  {paint('days of data per system per year', 'dim')}\n")
+    print(f"  {'':<{w}}  " + " ".join(f"{y[2:]:>5}" for y in years))
+    for sysname, metrics in systems.items():
+        cells = []
+        for y in years:
+            best = max((counts.get((m, y), 0) for m in metrics), default=0)
+            if best == 0:
+                cells.append(paint(f"{'·':>5}", "dim"))
+            elif best < 60:
+                cells.append(paint(f"{best:>5}", "warn"))
+            else:
+                cells.append(paint(f"{best:>5}", "ok"))
+        print(f"  {sysname:<{w}}  " + " ".join(cells))
+    print(f"\n  {paint('cell = best-covered metric in that system that year', 'dim')}")
+    print(f"  {paint('· none · <60d thin · ≥60d solid', 'dim')}\n")
+
+
+def cmd_brief(con, targets, args):
+    """Plain text for an agent: no colour, no boxes, everything on one line per
+    metric. Leads with what is off, since that is what a question would be about."""
+    rows = collect(con, targets)
+    if not rows:
+        print("health.db holds no metrics listed in health-targets.json")
+        return
+    newest = max(r["day"] for r in rows)
+    print(f"health.db as of {newest} ({len(rows)} metrics with data)")
+    for group, title in (("bad", "OUT OF CLINICAL RANGE"), ("warn", "OFF GOAL"),
+                         ("ok", "OK")):
+        sel = [r for r in rows if r["status"] == group]
+        if not sel:
+            continue
+        print(f"\n{title}:")
+        for r in sel:
+            t = f", {r['arrow']}" + (f"{r['pct']:+.0f}%" if r["pct"] is not None
+                                     and r["arrow"] != "→" else "")
+            note = f" [{r['note']}]" if r["note"] else ""
+            print(f"  {r['label']}: {r['value']:,.1f} {r['unit']}{note}"
+                  f" ({r['range'] or 'no range set'}{t}, {r['n']}d, last {r['day']})")
+    print("\nRanges and their sources: health-targets.json")
+    print("Raw-table traps (ring vs detail, sleep vocabularies, percent"
+          " fractions): docs/health-db.md")
+
+
+SUBCOMMANDS = ("goals", "coverage", "brief", "metric")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    sub = ap.add_subparsers(dest="cmd")
+    sub.add_parser("goals", help="only metrics with a personal goal")
+    sub.add_parser("coverage", help="data coverage by system and year")
+    sub.add_parser("brief", help="plain-text digest for an agent")
+    m = sub.add_parser("metric", help="one metric in detail")
+    m.add_argument("name")
+    m.add_argument("--limit", type=int, default=14)
+
+    # `health StepCount` should work, but argparse treats any bare word as a
+    # subcommand and errors out. Insert the implied `metric` before parsing
+    # rather than trying to recover afterwards.
+    argv = sys.argv[1:]
+    if argv and not argv[0].startswith("-") and argv[0] not in SUBCOMMANDS:
+        argv = ["metric"] + argv
+    args = ap.parse_args(argv)
+
+    con, targets = connect(), load_targets()
+    try:
+        {"goals": cmd_goals, "coverage": cmd_coverage, "brief": cmd_brief,
+         "metric": cmd_metric, None: cmd_now}[args.cmd](con, targets, args)
+    finally:
+        con.close()
+
+
+if __name__ == "__main__":
+    main()
