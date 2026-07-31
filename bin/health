@@ -4,10 +4,9 @@
 A raw number answers nothing. "Resting HR 61" only becomes useful next to the
 normal range, your own goal, and which way it has been moving.
 
-Ranges live in health-targets.json, split into `ref` (clinical normal, cited,
-not a preference) and `goal` (a value judgement, yours to change). A value can
-be inside `ref` and still miss `goal`; conflating the two would quietly turn
-published guidance into personal opinion.
+Context lives in health-targets.json, split into `ref` (a source-backed range,
+where one is broadly applicable) and `goal` (a personal choice, yours to add).
+A value can be inside `ref` and still miss `goal`; neither is a diagnosis.
 
   health              latest value per metric, with ref/goal/trend
   health goals        only the metrics that carry a goal
@@ -106,7 +105,7 @@ def series(con, metric):
 
 def verdict(value, spec):
     """(status, note) for one value. `goal` is checked before `ref` because a
-    value can clear the clinical range and still miss the target — reporting
+    value can clear the configured range and still miss the target — reporting
     only 'in range' there would hide the thing you actually care about."""
     ref, direction = spec.get("ref"), spec.get("direction", "band")
     gmin, gmax = spec.get("goal_min"), spec.get("goal_max")
@@ -163,6 +162,16 @@ def units(con):
             con.execute("SELECT metric, max(unit) unit FROM daily GROUP BY metric")}
 
 
+def cumulative_metrics(con):
+    """Metrics whose canonical daily value is a sum, plus derived sleep hours."""
+    metrics = {
+        r["metric"] for r in con.execute(
+            "SELECT DISTINCT metric FROM daily WHERE stat='sum'")
+    }
+    metrics.add("SleepHours")
+    return metrics
+
+
 def collect(con, targets, only_goals=False):
     """Latest usable value per metric.
 
@@ -175,8 +184,7 @@ def collect(con, targets, only_goals=False):
     out = []
     unit_map = units(con)
     partial = last_partial_day(con)
-    cumulative = {m for m, s in targets["metrics"].items()
-                  if s.get("direction") == "higher" or m == "SleepHours"}
+    cumulative = cumulative_metrics(con)
     for metric, spec in targets["metrics"].items():
         if only_goals and spec.get("goal_min") is None and spec.get("goal_max") is None:
             continue
@@ -351,7 +359,7 @@ def cmd_brief(con, targets, args):
         return
     newest = max(r["day"] for r in rows)
     print(f"health.db as of {newest} ({len(rows)} metrics with data)")
-    for group, title in (("bad", "OUT OF CLINICAL RANGE"), ("warn", "OFF GOAL"),
+    for group, title in (("bad", "OUTSIDE CONFIGURED RANGE"), ("warn", "OFF GOAL"),
                          ("ok", "OK")):
         sel = [r for r in rows if r["status"] == group]
         if not sel:

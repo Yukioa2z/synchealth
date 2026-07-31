@@ -9,12 +9,12 @@ health
 ```
 
 ```
-Health  21 metrics · newest 2026-07-30
-  1 out of range · 3 off goal
+Health  21 metrics · newest 2026-01-15
+  0 outside configured range
 
-  Blood oxygen (SpO2)      93.4 %     ↓ -4%   low            ref 95-100 · goal ≥95
-  Daily steps             5,493 count  → +1%   below goal 8000  ref 0-100000 · goal ≥8000
-  Resting HR                 58 count  ↓ -6%   at goal        ref 40-100 · goal ≤60
+  Blood oxygen (SpO2)      97.2 %     → +1%   normal         ref 95-100
+  Daily steps             7,120 count  ↑ +8%
+  Resting HR                 62 count  → +1%   normal         ref 40-100
   ...
 ```
 
@@ -34,7 +34,7 @@ is.
 Requires Python 3.9+ (macOS ships it at `/usr/bin/python3`) and nothing else.
 
 ```bash
-git clone https://github.com/<you>/synchealth
+git clone https://github.com/Yukioa2z/synchealth
 cd synchealth
 ./install.sh
 ```
@@ -42,27 +42,34 @@ cd synchealth
 Installs `synchealth-import`, `synchealth-watch`, `synchealth-server` and
 `health` into `~/.local/bin`, and seeds `~/.synchealth/health-targets.json`.
 
-## Getting data in
+## First setup: iPhone Full Sync
 
-Two paths. **Start with the export** — it is the complete history and it works
-today. Add the push receiver later if you want same-day numbers.
-
-### Path 1: manual export, automatic everything after
+The included iOS app is the normal first import. It reads your HealthKit
+history and uploads it to a receiver on **your own Mac**; the receiver creates
+`~/.synchealth/health.db` on first start, so you do not need to export Health
+data by hand.
 
 ```
-you:  Health app -> profile picture -> Export All Health Data
-      save export.zip to ~/Downloads or iCloud Drive/HealthExports
-        ▼ within 15 minutes
-synchealth-watch (launchd, every 900s)
-      ├─ unzip export.xml
-      ├─ synchealth-import  ->  health.db     (aggregated per day)
-      ├─ archive/export-<ts>.xml.gz           (raw, ~25:1)
-      └─ delete the zip
-        ▼
-health
+iPhone HealthKit -> SyncHealth iOS app -> HTTPS POST /health
+                                      -> ~/.synchealth/health.db
 ```
 
-Set it up:
+1. Install the command-line receiver with `./install.sh`.
+2. Create `~/.synchealth/server.json` with a random token, bind address and
+   port, then start `synchealth-server` (or install its LaunchAgent template).
+3. Make only `/health` reachable through an HTTPS tunnel or VPN if the phone
+   must sync outside your home network.
+4. Follow [the iOS build instructions](ios/README.md), enter that HTTPS URL
+   and token in the app, and run **Full Sync** once.
+
+The app then sends rolling incremental updates. iOS background scheduling is
+best effort; queued batches survive network failures and retry later.
+
+### Optional: manual Health export for recovery
+
+A manual export is not part of normal setup. Use it to repair a suspected gap
+or independently compare the phone's complete history. The watcher imports an
+export from `~/Downloads` or iCloud Drive:
 
 ```bash
 sed "s|__HOME__|$HOME|g" launchd/com.synchealth.watch.plist \
@@ -70,24 +77,17 @@ sed "s|__HOME__|$HOME|g" launchd/com.synchealth.watch.plist \
 launchctl load ~/Library/LaunchAgents/com.synchealth.watch.plist
 ```
 
-Or skip launchd and run `synchealth-watch` by hand after each export. Either
-way, imports are idempotent: re-importing the same export, or an older one, is
-safe.
+Or run `synchealth-watch` manually after exporting. Imports are idempotent and
+the completed export takes authority for finished days.
 
-**The export itself cannot be automated.** Apple exposes no API and no Shortcuts
-action for it — "Export All Health Data" is four manual taps, by design. Every
-project in this space that claims a fully automatic Apple Health pipeline is
-either running a paid third-party app on the phone (path 2) or is quietly
-manual here too. Plan on re-exporting every few weeks; nothing breaks if you
-forget, you just stop gaining new days.
-
-### Path 2: push receiver, for same-day data
+### Receiver configuration
 
 `synchealth-server` accepts the JSON format that
-[Health Auto Export](https://healthexportapp.com/) emits — the de-facto standard
-in this space, which FreeReps and the common Shortcuts recipes also speak. HAE
-is a paid app; it is the only shipping way to get HealthKit data off the phone on
-a schedule.
+[Health Auto Export](https://healthexportapp.com/) emits. The repository also
+includes a buildable iOS client under `ios/`, adapted from the MIT-licensed
+[FreeReps](https://github.com/meltforce/FreeReps) project. It adds a runtime
+`X-Health-Token`, durable on-device upload queue, rolling-window sync and
+background retry, while keeping the token in Keychain.
 
 ```
 phone -> POST https://<your-host>/health   (X-Health-Token)
@@ -103,11 +103,13 @@ cat > ~/.synchealth/server.json <<'EOF'
 {"token": "REPLACE-WITH-32-RANDOM-CHARS", "bind": "127.0.0.1", "port": 8738}
 EOF
 chmod 600 ~/.synchealth/server.json
-synchealth-server            # needs health.db to exist: run path 1 first
+synchealth-server
 ```
 
-Then in HAE: add a REST API automation, URL `https://<your-host>/health`,
-header `X-Health-Token: <your token>`, format JSON. No code changes.
+Build the app in Xcode, choose a unique Bundle ID and signing team, then enter
+the endpoint and token in its Settings screen. See [ios/README.md](ios/README.md)
+for the exact steps. If you already use HAE, it remains compatible: add a REST
+API automation with the same URL and header.
 
 **The token is not optional.** The server refuses to start without one, because
 the moment you expose this endpoint it accepts blood oxygen and heart rate from
@@ -121,9 +123,23 @@ it does not consume the phone's single VPN slot the way Tailscale or WireGuard
 does. iOS also tears down packet tunnels in the background, which makes a
 VPN-only setup unreliable for scheduled pushes.
 
-Both paths write the same tables, dedupe against each other, and can run
-together. The export is authoritative: when a push covered a day only partially,
-re-import and it is repaired.
+Both paths write the same tables and can run together. A later complete export
+is authoritative for finished days, so it repairs a partial phone upload.
+
+## Where your data lives
+
+All health data stays under `~/.synchealth/` on the Mac that runs the receiver:
+
+| Path | Contents |
+|---|---|
+| `health.db` | Queryable, daily health database and private tables |
+| `raw/` | Original encrypted-upload payloads, retained before aggregation |
+| `archive/` | Compressed manual exports, only when you use recovery import |
+| `server.json` | Receiver token and bind/port settings; mode 600 |
+| `*.log` | Receiver and recovery-import diagnostics |
+
+These are medical records, not repository files. The project `.gitignore`
+blocks them, but do not put this directory in ordinary cloud sync either.
 
 ## Reading it
 
@@ -136,14 +152,14 @@ health coverage     # which body systems have data in which year
 health brief        # plain text, for an LLM to read
 ```
 
-`ref` and `goal` are separate fields in `health-targets.json` on purpose. `ref`
-is a clinical range with a citation; `goal` is a value judgement no data can
-derive. A value can sit inside `ref` and still miss `goal`. Edit goals freely —
-changing a `ref` means you disagree with the source quoted in its `why`.
+`ref` and `goal` are separate fields in `health-targets.json` on purpose. A
+`ref` is included only where the linked source supports a broadly applicable
+adult resting range. A `goal` is a personal choice no data can derive.
 
-The defaults are seeded from published adult guidance and are not medical
-advice. Read the `why` on anything you plan to act on; a few (body fat, VO2 max)
-are sex-specific and default to the male band.
+The public template ships with **no goals** and no sex-specific defaults. Add
+`goal_min` or `goal_max` only after considering age, sex, pregnancy, disability,
+altitude, medication, diagnosis, device accuracy and your own priorities. This
+context is not diagnosis or medical advice.
 
 ## Going deeper
 
@@ -166,19 +182,25 @@ looks stale, why the design is shaped this way, and what was tried and rejected.
 
 ## Privacy
 
-Everything is local. Nothing phones home, and there is no telemetry.
+There is no SyncHealth cloud service, account or telemetry. The iOS app sends
+health data only to the endpoint you configure. If that endpoint uses a
+third-party tunnel, encrypted traffic necessarily passes through that
+provider's infrastructure; choose and configure the transport accordingly.
 
-`private_events` is a separate table for HealthKit types you would not want
-appearing in a digest you might show someone — `SexualActivity` by default.
-Rows there are queryable if you ask for them by name and are excluded from
-`daily`, from `/health/summary`, and from everything `health` prints. Add types
-to `PRIVATE_TYPES` in both `synchealth-import` and `synchealth-server` to extend
-it (reproductive health, mental-state logging, medication are the obvious
-candidates).
+`private_events` is a separate table for sensitive category types you would not
+want appearing in a digest: sexual activity, reproductive health, pregnancy
+and state-of-mind records are included in the default private set. These rows
+are queryable explicitly and excluded from `daily`, `/health/summary`, and
+everything `health` prints.
 
-`health.db` is your complete medical record in a 5MB file. Do not sync it
-anywhere you would not sync a medical record — that includes a git repo, however
-private.
+Rich objects that do not have a lossless relational mapping — ECGs, audiograms,
+medications, vision prescriptions, workout details and unmodelled category
+samples — land as JSON in `generic_events`. They are retained and queryable,
+but never enter automatic summaries.
+
+`health.db` is your complete medical record in one easy-to-copy file. Do not
+sync it anywhere you would not sync a medical record — that includes a git repo,
+however private. See [SECURITY.md](SECURITY.md) before exposing the receiver.
 
 ## Layout
 
@@ -187,12 +209,15 @@ bin/synchealth-import    export.xml -> health.db  (history, repair; idempotent)
 bin/synchealth-watch     watch dirs -> import -> archive  (launchd, 15 min)
 bin/synchealth-server    HAE-format POST -> health.db     (same schema)
 bin/health               the read surface
-health-targets.json      ref ranges (cited) + goals (yours)
+health-targets.json      sourced context + goals (unset until you add them)
+ios/                     Xcode project for the on-device HealthKit sync app
 launchd/                 plist templates for both daemons
 docs/health-db.md        schema and the four traps
 docs/pipeline.md         operations, design rationale, rejected approaches
 ```
 
-## License
+## License and upstream
 
-MIT
+The server, importer and CLI are MIT licensed. The iOS app is an adaptation of
+FreeReps and retains its upstream MIT notice in `ios/LICENSE`; see
+`ios/UPSTREAM.md` and `THIRD_PARTY_NOTICES.md` for provenance.

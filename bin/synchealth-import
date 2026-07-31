@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """synchealth-import — folds an Apple Health export.xml into health.db.
 
 Apple's export is the one complete source of truth for HealthKit data (the
@@ -30,6 +30,7 @@ Usage:
   synchealth-import <path-to-export.xml> [--db PATH]
 """
 import argparse
+import datetime
 import os
 import sqlite3
 import sys
@@ -180,6 +181,36 @@ CREATE TABLE IF NOT EXISTS imports (
   records INTEGER,
   days    INTEGER
 );
+
+-- A complete Apple export owns every finished day. Push payloads use rolling
+-- windows with a different bucket grain, so combining their sample counts with
+-- an export silently double-counts or truncates the day. The newest export day
+-- is intentionally left unlocked because the export captured it mid-day.
+CREATE TABLE IF NOT EXISTS export_authority (
+  day    TEXT NOT NULL,
+  metric TEXT NOT NULL,
+  imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (day, metric)
+);
+CREATE TABLE IF NOT EXISTS export_sleep_authority (
+  night TEXT PRIMARY KEY,
+  imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Push-side tables are declared here too so a repair import can discard stale
+-- partial samples for the days it replaces.
+CREATE TABLE IF NOT EXISTS samples (
+  day TEXT NOT NULL, metric TEXT NOT NULL, at TEXT NOT NULL,
+  value REAL, unit TEXT, PRIMARY KEY (day, metric, at, value)
+);
+CREATE TABLE IF NOT EXISTS sleep_segments (
+  id TEXT PRIMARY KEY, night TEXT NOT NULL, state TEXT NOT NULL,
+  kind TEXT NOT NULL, minutes REAL
+);
+CREATE TABLE IF NOT EXISTS generic_events (
+  section TEXT NOT NULL, id TEXT NOT NULL, day TEXT, at TEXT,
+  payload TEXT NOT NULL, PRIMARY KEY (section, id)
+);
 """
 
 SLEEP_PREFIX = "HKCategoryValueSleepAnalysis"
@@ -197,7 +228,12 @@ PERCENT_METRICS = {
 # PRIVATE_TYPES. `daily` is the shared read surface that summaries enumerate, so
 # a row there is a row in every digest. These land in `private_events` instead:
 # queryable on request, absent from every automatic report.
-PRIVATE_TYPES = {"SexualActivity"}
+PRIVATE_TYPES = {
+    "SexualActivity", "MenstrualFlow", "IntermenstrualBleeding",
+    "CervicalMucusQuality", "OvulationTestResult", "Contraceptive",
+    "Pregnancy", "PregnancyTestResult", "ProgesteroneTestResult", "Lactation",
+    "StateOfMind",
+}
 
 PRIVATE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS private_events (
@@ -220,20 +256,31 @@ def day_of(stamp):
 
 
 def minutes_between(start, end):
-    """Interval length in minutes. Hand-rolled because the only format Apple
-    emits is fixed-width, and this avoids a datetime parse per record on a
-    million-record file."""
-    def secs(s):
-        h, m, sec = int(s[11:13]), int(s[14:16]), int(s[17:19])
-        return h * 3600 + m * 60 + sec
-    d1, d2 = start[:10], end[:10]
-    delta = secs(end) - secs(start)
-    if d2 != d1:  # crosses midnight — count the day boundary once per day
-        import datetime
-        days = (datetime.date(int(d2[:4]), int(d2[5:7]), int(d2[8:10])) -
-                datetime.date(int(d1[:4]), int(d1[5:7]), int(d1[8:10]))).days
-        delta += days * 86400
-    return delta / 60.0
+    """Interval length in minutes, including timezone/DST transitions."""
+    def parse(stamp):
+        for layout in ("%Y-%m-%d %H:%M:%S %z", "%Y-%m-%dT%H:%M:%S%z",
+                       "%Y-%m-%d %H:%M:%S"):
+            try:
+                return datetime.datetime.strptime(stamp, layout)
+            except (TypeError, ValueError):
+                continue
+        raise ValueError(f"unsupported Health timestamp: {stamp!r}")
+
+    return (parse(end) - parse(start)).total_seconds() / 60.0
+
+
+def record_value(metric, raw):
+    """Convert an export Record value without turning StandHour Idle into stood."""
+    if metric == "AppleStandHour":
+        if (raw or "").endswith("Stood"):
+            return 1.0
+        if (raw or "").endswith("Idle"):
+            return 0.0
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        # Other category records use presence as the datum.
+        return 1.0
 
 
 def sleep_night(start):
@@ -246,7 +293,6 @@ def sleep_night(start):
     sleep deficit, when the truth is that the night simply was not recorded.
     A nap is any segment starting between 10:00 and 18:00.
     """
-    import datetime
     hour = int(start[11:13])
     d = datetime.date(int(start[:4]), int(start[5:7]), int(start[8:10]))
     if 10 <= hour < 18:
@@ -262,8 +308,12 @@ def main():
     ap.add_argument("--db", default=DEFAULT_DB)
     args = ap.parse_args()
 
-    os.makedirs(os.path.dirname(os.path.abspath(args.db)), exist_ok=True)
+    os.umask(0o077)
+    db_dir = os.path.dirname(os.path.abspath(args.db))
+    os.makedirs(db_dir, mode=0o700, exist_ok=True)
+    os.chmod(db_dir, 0o700)
     db = sqlite3.connect(args.db)
+    os.chmod(args.db, 0o600)
     db.executescript(SCHEMA)
     db.executescript(PRIVATE_SCHEMA)
 
@@ -281,7 +331,10 @@ def main():
             metric = el.get("type", "").split("Identifier")[-1]
             start, end = el.get("startDate"), el.get("endDate")
             raw = el.get("value")
-            src_agg[(metric, el.get("sourceName", "?"))] += 1
+            # Even a source-name count can disclose that a sensitive type
+            # exists. Private types belong only in private_events.
+            if metric not in PRIVATE_TYPES:
+                src_agg[(metric, el.get("sourceName", "?"))] += 1
             n_records += 1
 
             if metric == "SleepAnalysis":
@@ -303,12 +356,7 @@ def main():
                                     start, minutes_between(start, end),
                                     (raw or ""), el.get("sourceName")))
             else:
-                try:
-                    v = float(raw)
-                except (TypeError, ValueError):
-                    # category records without a numeric value (MenstrualFlow,
-                    # AppleStandHour): presence is the datum
-                    v = 1.0
+                v = record_value(metric, raw)
                 key = (metric, start, end, raw)
                 if key not in seen:
                     seen.add(key)
@@ -344,6 +392,30 @@ def main():
                      total, avg, min(vals), max(vals), a["last"], len(vals)))
 
     with db:
+        private_placeholders = ",".join("?" for _ in PRIVATE_TYPES)
+        db.execute(
+            f"DELETE FROM daily WHERE metric IN ({private_placeholders})",
+            tuple(PRIVATE_TYPES))
+        db.execute(
+            f"DELETE FROM samples WHERE metric IN ({private_placeholders})",
+            tuple(PRIVATE_TYPES))
+        db.execute(
+            f"DELETE FROM sources WHERE metric IN ({private_placeholders})",
+            tuple(PRIVATE_TYPES))
+
+        imported_keys = [(r[0], r[1]) for r in rows]
+        if imported_keys:
+            # A repair import replaces push samples rather than mixing two
+            # incompatible bucket grains. The next push can rebuild only the
+            # newest, deliberately-unlocked export day.
+            db.executemany(
+                "DELETE FROM samples WHERE day=? AND metric=?", imported_keys)
+        imported_nights = sorted({k[0] for k in sleep_agg})
+        if imported_nights:
+            db.executemany(
+                "DELETE FROM sleep_segments WHERE night=?",
+                [(night,) for night in imported_nights])
+
         db.executemany(
             "INSERT INTO daily (day,metric,unit,stat,value,sum,avg,min,max,last,n)"
             " VALUES (?,?,?,?,?,?,?,?,?,?,?)"
@@ -375,6 +447,29 @@ def main():
             "INSERT INTO sources (metric,source,n) VALUES (?,?,?)"
             " ON CONFLICT(metric,source) DO UPDATE SET n=excluded.n",
             [(k[0], k[1], v) for k, v in src_agg.items()])
+
+        newest_day = max((r[0] for r in rows), default=None)
+        if newest_day:
+            db.executemany(
+                "INSERT INTO export_authority(day,metric) VALUES (?,?)"
+                " ON CONFLICT(day,metric) DO UPDATE SET"
+                " imported_at=CURRENT_TIMESTAMP",
+                [(day, metric) for day, metric in imported_keys
+                 if day < newest_day])
+        newest_ring_day = max((r[0] for r in rings), default=None)
+        if newest_ring_day:
+            db.executemany(
+                "INSERT INTO export_authority(day,metric) VALUES (?,'__rings__')"
+                " ON CONFLICT(day,metric) DO UPDATE SET"
+                " imported_at=CURRENT_TIMESTAMP",
+                [(r[0],) for r in rings if r[0] < newest_ring_day])
+        newest_night = max(imported_nights, default=None)
+        if newest_night:
+            db.executemany(
+                "INSERT INTO export_sleep_authority(night) VALUES (?)"
+                " ON CONFLICT(night) DO UPDATE SET imported_at=CURRENT_TIMESTAMP",
+                [(night,) for night in imported_nights if night < newest_night])
+
         db.execute(
             "INSERT INTO imports (at,path,records,days) VALUES"
             " (datetime('now','localtime'),?,?,?)",

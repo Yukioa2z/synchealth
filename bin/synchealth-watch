@@ -27,6 +27,7 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -68,10 +69,12 @@ def importer():
 
 
 def log(msg):
-    LOG.parent.mkdir(parents=True, exist_ok=True)
+    LOG.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    LOG.parent.chmod(0o700)
     line = f"{time.strftime('%F %T')} {msg}"
     with open(LOG, "a") as f:
         f.write(line + "\n")
+    LOG.chmod(0o600)
     print(line)
 
 
@@ -118,11 +121,13 @@ def archive(xml_path):
     """Keep the raw export, gzipped (roughly 25:1). It is the only complete
     source of truth: the importer's aggregation can be rebuilt from it, but a
     deleted export is gone, and Apple will not reissue an old one."""
-    ARCHIVE.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
-    dest = ARCHIVE / f"export-{stamp}.xml.gz"
+    ARCHIVE.mkdir(parents=True, mode=0o700, exist_ok=True)
+    ARCHIVE.chmod(0o700)
+    stamp = datetime.now().strftime("%Y%m%dT%H%M%S.%f")
+    dest = ARCHIVE / f"export-{stamp}-{uuid.uuid4().hex[:8]}.xml.gz"
     with open(xml_path, "rb") as src, gzip.open(dest, "wb", compresslevel=6) as dst:
         shutil.copyfileobj(src, dst, length=8 << 20)
+    dest.chmod(0o600)
     return dest
 
 
@@ -135,7 +140,7 @@ def process(zip_path, imp):
     work = HOME / "incoming"
     if work.exists():
         shutil.rmtree(work)
-    work.mkdir(parents=True)
+    work.mkdir(parents=True, mode=0o700)
     try:
         xml = extract_xml(zip_path, work)
         if not xml:
@@ -170,6 +175,9 @@ def process(zip_path, imp):
 
 
 def main():
+    os.umask(0o077)
+    HOME.mkdir(parents=True, mode=0o700, exist_ok=True)
+    HOME.chmod(0o700)
     imp = importer()
     if not imp.exists():
         sys.exit(f"{imp} not found — install synchealth-import or set "

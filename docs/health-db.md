@@ -4,8 +4,9 @@
 queryable shape. Small enough to hand to an LLM turn directly, which is why the
 schema aggregates instead of storing raw samples.
 
-Build it: `synchealth-import <export.xml>` (idempotent; re-running overwrites the
-same day/metric rows).
+Normal setup builds it through the iOS app's first Full Sync. `synchealth-import
+<export.xml>` is an optional recovery path (idempotent; re-running overwrites
+the same day/metric rows).
 
 Scale, from an 11-year reference export: ~1.1M raw records collapsed to ~24k
 rows across ~3,600 days — about 4MB, 7 seconds.
@@ -23,7 +24,10 @@ rows across ~3,600 days — about 4MB, 7 seconds.
 | `sources` | (metric, source) | Per-device record counts, for auditing |
 | `samples` | (day, metric, at, value) | Written by the push path only; the deduped point set `daily` is recomputed from |
 | `sleep_segments` | id | Push path only; deduped sleep segments by HK sample id |
-| `private_events` | id | Types deliberately excluded from every summary (see below) |
+| `export_authority` | (day, metric) | Finished export rows that rolling-window pushes may not overwrite; `__rings__` reserves a whole ring day |
+| `export_sleep_authority` | night | Finished export nights that pushes may not overwrite |
+| `private_events` | id | Sensitive category types deliberately excluded from every summary (see below) |
+| `generic_events` | (section, id) | Lossless JSON for rich/unmodelled pushed objects; never included in automatic summaries |
 | `imports` | — | One row per import: when, which file, how many records |
 
 ## The four traps
@@ -122,7 +126,8 @@ collapse.
 
 `PRIVATE_TYPES` in both `synchealth-import` and `synchealth-server` lists
 HealthKit types that never enter `daily` and land in `private_events` instead.
-Default is `SexualActivity`.
+The default includes sexual activity; menstrual, fertility, contraception and
+pregnancy records; lactation; and state of mind.
 
 The reason is structural: `daily` is the shared read surface, and anything that
 enumerates it — `/health/summary`, any digest you write later — will include
@@ -132,6 +137,19 @@ someone.
 
 If you extend the set, edit both files. They keep separate copies on purpose:
 each must run standalone.
+
+## generic_events
+
+Some phone payload sections cannot be represented faithfully by a single daily
+number. ECG waveforms, audiograms, medication records, vision prescriptions,
+state-of-mind objects, full workout details, full activity summaries and
+otherwise-unmodelled category samples are stored as compact JSON in
+`generic_events`.
+
+The primary key is `(section, id)`. If a HealthKit object has no id, the server
+uses a SHA-256 hash of its canonical JSON, so rolling-window retries stay
+idempotent. This table is queryable only when named explicitly; neither
+`health` nor `/health/summary` enumerates it.
 
 ## Useful queries
 

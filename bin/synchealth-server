@@ -30,11 +30,14 @@ bind defaults to loopback because a tunnel daemon connects locally; set it to a
 LAN or VPN address only if something on that network must reach it directly.
 """
 import hmac
+import hashlib
 import json
 import os
+import runpy
 import sqlite3
 import sys
 import time
+import uuid
 from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -112,6 +115,13 @@ PERCENT_METRICS = {
 # unambiguously a fraction.
 PERCENT_FRACTION_CEILING = 1.5
 
+PRIVATE_TYPES = {
+    "SexualActivity", "MenstrualFlow", "IntermenstrualBleeding",
+    "CervicalMucusQuality", "OvulationTestResult", "Contraceptive",
+    "Pregnancy", "PregnancyTestResult", "ProgesteroneTestResult", "Lactation",
+    "StateOfMind",
+}
+
 
 def load_conf():
     if not CONF.exists():
@@ -119,6 +129,7 @@ def load_conf():
     conf = json.loads(CONF.read_text())
     if not conf.get("token") or len(conf["token"]) < 16:
         sys.exit("server.json needs a token of at least 16 chars")
+    CONF.chmod(0o600)
     return conf
 
 
@@ -168,6 +179,88 @@ def sleep_night(dt):
     return dt.date().isoformat(), "night"
 
 
+def ensure_runtime_schema(db):
+    """Create push/authority tables for both new and pre-migration databases."""
+    db.executescript("""
+    CREATE TABLE IF NOT EXISTS samples (
+      day TEXT NOT NULL, metric TEXT NOT NULL, at TEXT NOT NULL,
+      value REAL, unit TEXT, PRIMARY KEY (day, metric, at, value)
+    );
+    CREATE TABLE IF NOT EXISTS sleep_segments (
+      id TEXT PRIMARY KEY, night TEXT NOT NULL, state TEXT NOT NULL,
+      kind TEXT NOT NULL, minutes REAL
+    );
+    CREATE TABLE IF NOT EXISTS export_authority (
+      day TEXT NOT NULL, metric TEXT NOT NULL,
+      imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (day, metric)
+    );
+    CREATE TABLE IF NOT EXISTS export_sleep_authority (
+      night TEXT PRIMARY KEY,
+      imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS generic_events (
+      section TEXT NOT NULL,
+      id TEXT NOT NULL,
+      day TEXT,
+      at TEXT,
+      payload TEXT NOT NULL,
+      PRIMARY KEY (section, id)
+    );
+    """)
+
+
+def ensure_database(db):
+    """Create the complete local schema before the first iOS Full Sync.
+
+    The importer owns the schema contract shared by manual recovery imports and
+    phone pushes. Loading its declarations here keeps a fresh self-hosted
+    receiver usable without requiring a user to first export Health data by
+    hand.
+    """
+    importer = runpy.run_path(str(Path(__file__).with_name("synchealth-import")))
+    db.executescript(importer["SCHEMA"])
+    db.executescript(importer["PRIVATE_SCHEMA"])
+    ensure_runtime_schema(db)
+
+
+def export_locked(db, day, metric):
+    return db.execute(
+        "SELECT 1 FROM export_authority WHERE day=? AND metric=?",
+        (day, metric)).fetchone() is not None
+
+
+GENERIC_SECTIONS = (
+    "ecg_recordings", "audiograms", "medications",
+    "vision_prescriptions", "state_of_mind",
+)
+
+
+def store_generic_event(db, section, item):
+    """Keep an otherwise-unmodelled HealthKit object queryable and private."""
+    encoded = json.dumps(item, sort_keys=True, separators=(",", ":"))
+    event_id = str(item.get("id") or hashlib.sha256(encoded.encode()).hexdigest())
+    at = (item.get("start_date") or item.get("date_issued")
+          or item.get("date") or item.get("startDate"))
+    day, _ = parse_time(at)
+    db.execute(
+        "INSERT INTO generic_events(section,id,day,at,payload) VALUES (?,?,?,?,?)"
+        " ON CONFLICT(section,id) DO UPDATE SET day=excluded.day,"
+        " at=excluded.at, payload=excluded.payload",
+        (section, event_id, day, at, encoded))
+
+
+def fold_generic_sections(data, db, counts):
+    for section in GENERIC_SECTIONS:
+        for item in data.get(section) or []:
+            if not isinstance(item, dict):
+                counts["skipped"] += 1
+                continue
+            store_generic_event(db, section, item)
+            counts["generic"] += 1
+            counts["points"] += 1
+
+
 def fold(payload, db):
     """Fold one HAE payload into daily/sleep/workouts/rings. Returns a count dict.
 
@@ -184,7 +277,7 @@ def fold(payload, db):
     """
     data = payload.get("data") or {}
     counts = {"metrics": 0, "points": 0, "sleep": 0, "workouts": 0,
-              "rings": 0, "skipped": 0}
+              "rings": 0, "generic": 0, "skipped": 0, "export_locked": 0}
 
     per_day = {}   # (day, metric) -> accumulator
     sleep_rows = {}
@@ -253,11 +346,11 @@ def fold(payload, db):
             counts["points"] += 1
 
     with db:
-        db.execute(
-            "CREATE TABLE IF NOT EXISTS samples ("
-            " day TEXT NOT NULL, metric TEXT NOT NULL, at TEXT NOT NULL,"
-            " value REAL, unit TEXT, PRIMARY KEY (day, metric, at, value))")
+        ensure_runtime_schema(db)
         for (day, metric), a in per_day.items():
+            if export_locked(db, day, metric):
+                counts["export_locked"] += len(a["points"])
+                continue
             db.executemany(
                 "INSERT OR IGNORE INTO samples (day,metric,at,value,unit)"
                 " VALUES (?,?,?,?,?)",
@@ -292,6 +385,11 @@ def fold(payload, db):
                  s_min, s_max, last, s_n))
 
         for (night, state, kind), mins in sleep_rows.items():
+            if db.execute(
+                    "SELECT 1 FROM export_sleep_authority WHERE night=?",
+                    (night,)).fetchone():
+                counts["export_locked"] += 1
+                continue
             # Sleep is authoritative per push: the phone recomputes the whole
             # night, so replace rather than accumulate (accumulating would
             # double a night that gets pushed twice).
@@ -300,11 +398,16 @@ def fold(payload, db):
                 " ON CONFLICT(night,state,kind) DO UPDATE SET"
                 " minutes=excluded.minutes",
                 (night, state, kind, mins))
+            counts["points"] += 1
 
         for w in data.get("workouts") or []:
             start, _ = parse_time(w.get("start"))
             if not w.get("start"):
                 continue
+            # The relational table keeps the summary; the private generic row
+            # preserves route, heart-rate series, energy and other rich fields.
+            store_generic_event(db, "workout_details", w)
+            counts["generic"] += 1
             db.execute(
                 "INSERT INTO workouts (start,end,activity,minutes,source)"
                 " VALUES (?,?,?,?,?) ON CONFLICT(start) DO UPDATE SET"
@@ -313,9 +416,11 @@ def fold(payload, db):
                 (w.get("start"), w.get("end"), w.get("name"),
                  float(w.get("duration") or 0), w.get("source") or "push"))
             counts["workouts"] += 1
+            counts["points"] += 1
 
         fold_category_samples(data.get("category_samples") or [], db, counts)
         fold_activity_summaries(data.get("activity_summaries") or [], db, counts)
+        fold_generic_sections(data, db, counts)
     return counts
 
 
@@ -344,11 +449,6 @@ SLEEP_LABELS = {
 # queryable on request and out of every automatic summary. Nothing reads
 # `private_events`; that is the point.
 #
-# Add any HealthKit type you would not want appearing in a digest you might
-# show someone: reproductive health, mental-state logging, medication.
-PRIVATE_TYPES = {"SexualActivity"}
-
-
 def fold_category_samples(samples, db, counts):
     """Fold data.category_samples — the array most integrations forget.
 
@@ -364,7 +464,10 @@ def fold_category_samples(samples, db, counts):
     would double a re-pushed night while replacing with a partial window would
     truncate a real one.
     """
-    seg_rows, stand, private = [], {}, []
+    seg_rows, stand, private, generic = [], {}, [], []
+    locked_nights = {
+        row[0] for row in db.execute("SELECT night FROM export_sleep_authority")
+    }
     for c in samples:
         ctype = (c.get("type") or "").split("Identifier")[-1]
         sid = c.get("id")
@@ -388,6 +491,9 @@ def fold_category_samples(samples, db, counts):
             label = (c.get("value_label") or "").strip()
             state = SLEEP_LABELS.get(label, label.replace(" ", "") or "Unknown")
             night, kind = sleep_night(dt1)
+            if night in locked_nights:
+                counts["export_locked"] += 1
+                continue
             seg_rows.append((sid, night, state, kind,
                              (dt2 - dt1).total_seconds() / 60.0))
         elif ctype == "AppleStandHour":
@@ -395,16 +501,21 @@ def fold_category_samples(samples, db, counts):
             if day is None or not sid:
                 counts["skipped"] += 1
                 continue
+            if export_locked(db, day, "AppleStandHour"):
+                counts["export_locked"] += 1
+                continue
             # value 1 = Stood, 0 = Idle, so summing the values counts stood
-            # hours. Note this is stricter than synchealth-import, which sees
-            # export.xml's non-numeric value and counts every record as 1 —
-            # i.e. Stood + Idle. `rings.stand_hours` is the number to trust for
-            # history; this column is only reliable for push-covered days.
+            # hours. synchealth-import applies the same mapping to export.xml's
+            # category labels; `rings.stand_hours` remains the most complete
+            # historical source when Apple omits older detail records.
             stand.setdefault(day, []).append(
                 (c.get("start_date") or c.get("startDate"),
                  float(c.get("value") or 0)))
         else:
-            counts["skipped"] += 1
+            if not sid:
+                counts["skipped"] += 1
+                continue
+            generic.append(c)
 
     if private:
         db.execute(
@@ -419,11 +530,8 @@ def fold_category_samples(samples, db, counts):
         # Counted separately from `points` so the server log doesn't imply these
         # rows landed in the reporting tables.
         counts["private"] = counts.get("private", 0) + len(private)
+        counts["points"] += len(private)
 
-    db.execute(
-        "CREATE TABLE IF NOT EXISTS sleep_segments ("
-        " id TEXT PRIMARY KEY, night TEXT NOT NULL, state TEXT NOT NULL,"
-        " kind TEXT NOT NULL, minutes REAL)")
     if seg_rows:
         db.executemany(
             "INSERT INTO sleep_segments (id,night,state,kind,minutes)"
@@ -444,6 +552,12 @@ def fold_category_samples(samples, db, counts):
                 " minutes=excluded.minutes, n=excluded.n",
                 (night, state, kind, mins, n))
             counts["sleep"] += n
+        counts["points"] += len(seg_rows)
+
+    for item in generic:
+        store_generic_event(db, "category_samples", item)
+    counts["generic"] += len(generic)
+    counts["points"] += len(generic)
 
     for day, points in stand.items():
         db.executemany(
@@ -477,6 +591,11 @@ def fold_activity_summaries(summaries, db, counts):
         if not day:
             counts["skipped"] += 1
             continue
+        if export_locked(db, day, "__rings__"):
+            counts["export_locked"] += 1
+            continue
+        store_generic_event(db, "activity_summary_details", s)
+        counts["generic"] += 1
         db.execute(
             "INSERT INTO rings (day,active_kcal,exercise_min,stand_hours,move_min)"
             " VALUES (?,?,?,?,0) ON CONFLICT(day) DO UPDATE SET"
@@ -487,6 +606,7 @@ def fold_activity_summaries(summaries, db, counts):
              float(s.get("exercise_time") or 0),
              float(s.get("stand_hours") or 0)))
         counts["rings"] += 1
+        counts["points"] += 1
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -515,7 +635,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._reply(404, {"error": "not found"})
         if not self._authed():
             return
-        n = int(self.headers.get("Content-Length") or 0)
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return self._reply(400, {"error": "Content-Length must be an integer"})
         if n <= 0 or n > MAX_BODY:
             return self._reply(413, {"error": f"body must be 1..{MAX_BODY} bytes"})
         blob = self.rfile.read(n)
@@ -527,10 +650,13 @@ class Handler(BaseHTTPRequestHandler):
 
         # Land the raw payload before folding: if aggregation is wrong we can
         # re-fold, but an unrecorded push is gone.
-        RAW.mkdir(parents=True, exist_ok=True)
+        RAW.mkdir(parents=True, mode=0o700, exist_ok=True)
+        RAW.chmod(0o700)
         stamp = time.strftime("%Y%m%dT%H%M%S")
-        p = RAW / f"{stamp}-{len(blob)}.json"
-        p.write_bytes(blob)
+        p = RAW / f"{stamp}-{time.time_ns()}-{uuid.uuid4().hex[:8]}.json"
+        with p.open("xb") as raw_file:
+            raw_file.write(blob)
+        p.chmod(0o600)
 
         db = sqlite3.connect(DB)
         try:
@@ -591,16 +717,20 @@ class Server(ThreadingHTTPServer):
         self.logfile = HOME / "server.log"
 
     def log(self, msg):
+        self.logfile.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
         with open(self.logfile, "a") as f:
             f.write(f"{time.strftime('%F %T')} {msg}\n")
+        self.logfile.chmod(0o600)
 
 
 def main():
+    os.umask(0o077)
     conf = load_conf()
-    HOME.mkdir(parents=True, exist_ok=True)
-    if not DB.exists():
-        sys.exit(f"{DB} not found — run synchealth-import on an export.xml first "
-                 "so the schema and history exist")
+    HOME.mkdir(parents=True, mode=0o700, exist_ok=True)
+    HOME.chmod(0o700)
+    with sqlite3.connect(DB) as db:
+        ensure_database(db)
+    DB.chmod(0o600)
     bind = conf.get("bind", "127.0.0.1")
     port = int(conf.get("port", 8738))
     srv = Server((bind, port), conf["token"])

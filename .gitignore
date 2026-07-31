@@ -8,3 +8,16 @@ archive/
 *.log
 __pycache__/
 .DS_Store
+
+# Xcode local state and signing material.
+DerivedData/
+.swiftpm/
+xcuserdata/
+*.xcuserstate
+*.mobileprovision
+*.p12
+*.cer
+
+# Apple Health exports are medical records too.
+export.xml
+export*.zip

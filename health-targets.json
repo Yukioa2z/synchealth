@@ -1,149 +1,129 @@
 {
-  "_readme": "Reference ranges and personal goals for `health` (the CLI view over health.db). Two different things, deliberately separate: `ref` is a clinical normal range — not a choice, it comes from published guidance — while `goal` is a value judgement about where you want to be, which no amount of data can derive. A metric can sit inside `ref` and still miss `goal`. Edit `goal` freely; changing `ref` means disagreeing with the cited source. Direction: 'higher' = more is better, 'lower' = less is better, 'band' = stay inside the range. Seeded from standard adult guidance; every entry cites where the number came from so a future reader can check it rather than trust it. These defaults assume a healthy adult — read each `why` before relying on one.",
+  "_readme": "Reference context and personal goals for `health`. This public template deliberately ships with no personal goals: age, sex, pregnancy, disability, altitude, medication, diagnosis, device accuracy, and the user's own priorities can all change what is appropriate. `ref` is included only where the linked source supports a broadly applicable adult resting range. Add goal_min or goal_max yourself after deciding what is right for you. This file is educational context, not diagnosis or medical advice.",
 
   "metrics": {
     "RestingHeartRate": {
       "label": "Resting HR",
-      "direction": "lower",
+      "direction": "band",
       "ref": [40, 100],
-      "goal_max": 60,
-      "why": "AHA calls 60-100 bpm normal for adults; athletes commonly 40-60. Sub-60 at rest is a fitness marker, so the goal is stricter than the clinical floor."
+      "why": "The American Heart Association says 60-100 bpm is normal for most adults and that physically active adults may be as low as 40 bpm. Symptoms, medication and medical history matter more than this broad screen.",
+      "source": "https://www.heart.org/en/healthy-living/exercise-and-physical-activity/fitness-basics/target-heart-rates"
     },
     "HeartRate": {
       "label": "Heart rate (all-day avg)",
-      "direction": "lower",
-      "ref": [50, 110],
-      "why": "All-day average mixes rest and activity, so no clinical range applies directly. Wide band flags only data problems or sustained tachycardia — read RestingHeartRate for signal."
+      "direction": "band",
+      "why": "An all-day average mixes rest, exercise and missing wear time, so a resting clinical range does not apply. Use the personal trend and RestingHeartRate instead."
     },
     "HeartRateVariabilitySDNN": {
       "label": "HRV (SDNN)",
       "direction": "higher",
-      "ref": [20, 200],
-      "goal_min": 50,
-      "why": "SDNN is strongly age- and individual-dependent; absolute cutoffs are weak evidence. Population studies put healthy adult overnight SDNN around 40-100ms. Treat your own trend as the signal, not the number."
+      "why": "HRV depends strongly on age, measurement duration, posture, device and the individual. This template does not turn a population distribution into a personal threshold."
     },
     "OxygenSaturation": {
       "label": "Blood oxygen (SpO2)",
-      "direction": "higher",
+      "direction": "band",
       "ref": [95, 100],
-      "goal_min": 95,
-      "why": "95-100% is the standard normal for healthy adults at sea level; below 95 warrants attention, below 90 is hypoxemia. Wrist sensors read low on cold or poorly-perfused skin, so a single low value is usually artifact."
+      "why": "The FDA says 95-100% is typical for most healthy people, while altitude, circulation, skin pigmentation, temperature and device limitations affect readings. Do not diagnose or change treatment from a watch reading alone.",
+      "source": "https://www.fda.gov/consumers/consumer-updates/pulse-oximeter-basics"
     },
     "RespiratoryRate": {
       "label": "Respiratory rate",
       "direction": "band",
-      "ref": [12, 20],
-      "why": "12-20 breaths/min is the standard adult resting range. Sleep values run at or slightly below the low end."
+      "ref": [12, 18],
+      "why": "MedlinePlus lists 12-18 breaths per minute as a normal resting adult vital-sign range. This does not apply during exercise and should not replace clinical assessment.",
+      "source": "https://medlineplus.gov/ency/article/002341.htm"
     },
     "StepCount": {
       "label": "Daily steps",
       "direction": "higher",
-      "ref": [0, 100000],
-      "goal_min": 8000,
-      "why": "Mortality benefit rises steeply to ~8000 steps/day and plateaus near 10000 (Paluch 2021, JAMA Netw Open). 8000 is where the curve flattens, so it is the honest target; 10000 was a 1960s pedometer slogan."
+      "why": "Large cohort studies associate more daily steps with lower mortality, but they do not establish one universal daily prescription. Pick a goal relative to your baseline, mobility and clinician's advice.",
+      "source": "https://jamanetwork.com/journals/jamanetworkopen/fullarticle/2783711"
     },
     "AppleExerciseTime": {
       "label": "Exercise minutes",
       "direction": "higher",
-      "ref": [0, 600],
-      "goal_min": 21,
-      "why": "WHO recommends 150 min/week of moderate activity = ~21 min/day. The daily framing is a convenience; the weekly total is what the guidance actually says."
+      "why": "WHO guidance is weekly: adults should generally get at least 150 minutes of moderate activity, or 75 minutes vigorous, plus muscle strengthening. A daily goal can misrepresent that weekly recommendation.",
+      "source": "https://www.who.int/news-room/fact-sheets/detail/physical-activity"
     },
     "AppleStandHour": {
       "label": "Stand hours",
       "direction": "higher",
-      "ref": [0, 24],
-      "goal_min": 12,
-      "why": "No clinical guideline exists; 12 is Apple's own default ring target and a reasonable proxy for breaking up sedentary time."
+      "why": "This is an Apple ring measure, not a universal clinical threshold. Set a personal goal only if the ring is useful for breaking up your own sedentary time."
     },
     "TimeInDaylight": {
       "label": "Daylight",
       "direction": "higher",
-      "ref": [0, 1440],
-      "goal_min": 120,
-      "why": "Observational work links >2h/day outdoor light to better mood, sleep timing and myopia outcomes. Weaker evidence than the cardio numbers; treat as directional."
+      "why": "HealthKit records exposure time, but this template does not prescribe a universal daily target."
     },
     "DistanceWalkingRunning": {
       "label": "Walk+run distance",
       "direction": "higher",
-      "ref": [0, 100],
-      "goal_min": 5,
-      "why": "Roughly the distance implied by the 8000-step goal at an average adult step length (~65cm). Derived from the step goal, not independent guidance — recompute from your own WalkingStepLength if you care about the number."
+      "why": "Distance depends on stride length, mobility and activity type. It is best treated as a personal trend rather than a population target."
     },
     "SleepHours": {
       "label": "Time asleep",
       "direction": "higher",
-      "ref": [6, 10],
-      "goal_min": 7,
       "min_days": 30,
-      "why": "AASM/Sleep Research Society consensus: 7+ hours per night for adults. `min_days` suppresses a verdict until 30 nights exist in the last 90 days, because sleep coverage is commonly poor: pre-watchOS-9 and third-party records log time in bed rather than sleep, and a watch that is charging overnight records nothing. Judging a night against a 7h goal from a stale fragment would invent a finding."
+      "why": "AASM and Sleep Research Society recommend that adults generally sleep 7 or more hours per night. They did not set a universal upper limit, and sleep need varies, so this public template leaves the goal unset. min_days avoids judging a sparse or stale watch record.",
+      "source": "https://aasm.org/resources/pdf/pressroom/adult-sleep-duration-consensus.pdf"
     },
     "BodyMass": {
       "label": "Weight",
       "direction": "band",
-      "why": "No universal target; BMI needs height and says little about composition. Tracked for trend only."
+      "why": "No universal target is meaningful without height, body composition, health history and the individual's goals. Track the trend only unless you set a personal range."
     },
     "BodyFatPercentage": {
       "label": "Body fat",
-      "direction": "lower",
-      "ref": [8, 25],
-      "goal_max": 20,
-      "why": "ACE puts 'fitness' range at 14-17% and 'acceptable' at 18-24% for adult men; the corresponding bands for women run roughly 10 points higher. Set both ref and goal for your own body — this default is the male band."
+      "direction": "band",
+      "why": "Interpretation varies by sex, age, device and clinical context. The public template intentionally has no male or female default."
     },
     "VO2Max": {
       "label": "VO2 max",
       "direction": "higher",
-      "ref": [30, 60],
-      "goal_min": 45,
-      "why": "Cooper Institute norms put 'good' for men 30-49 near 45 mL/kg/min; women's norms run about 8-10 mL/kg/min lower at the same age. One of the strongest single predictors of all-cause mortality, so worth a goal even on sparse data."
+      "why": "Reference values vary substantially by age, sex, protocol and device estimation. Compare against an appropriate source or clinician before adding a goal."
     },
     "WalkingHeartRateAverage": {
       "label": "Walking HR",
       "direction": "lower",
-      "ref": [70, 130],
-      "why": "No clinical cutoff. A falling walking HR at constant pace is an aerobic-fitness signal, which is why it is tracked at all."
+      "why": "There is no universal cutoff for an all-walking average. Pace, terrain, temperature, medication and fitness all affect it; use comparable personal trends."
     },
     "AppleWalkingSteadiness": {
       "label": "Walking steadiness",
       "direction": "higher",
-      "ref": [50, 100],
-      "goal_min": 90,
-      "why": "Apple's own bands: OK >=50%, Low 25-50%, Very Low <25%. Only meaningful as a fall-risk screen in older adults."
+      "why": "This is an Apple-derived mobility classification, not a general percentage target. Interpret it through Apple's Health app and clinical context.",
+      "source": "https://developer.apple.com/documentation/healthkit/hkapplewalkingsteadinessclassification"
     },
     "HeadphoneAudioExposure": {
       "label": "Headphone audio",
       "direction": "lower",
-      "ref": [0, 80],
-      "goal_max": 75,
-      "why": "WHO safe-listening: 80 dB for 40h/week for adults. Sustained exposure above that accumulates hearing damage."
+      "why": "WHO safe-listening guidance combines loudness and duration: for example, 80 dB for up to 40 hours per week. A daily average alone cannot represent dose, so no simple range is configured.",
+      "source": "https://www.who.int/news-room/questions-and-answers/item/deafness-and-hearing-loss-safe-listening"
     },
     "EnvironmentalAudioExposure": {
       "label": "Environment audio",
       "direction": "lower",
-      "ref": [0, 80],
-      "why": "Same WHO 80 dB basis as headphone exposure, applied to ambient sound."
+      "why": "Hearing risk depends on both level and exposure duration. This daily average is useful for trend inspection but is not a complete exposure-dose calculation.",
+      "source": "https://www.who.int/news-room/questions-and-answers/item/deafness-and-hearing-loss-safe-listening"
     },
     "FlightsClimbed": {
       "label": "Flights climbed",
       "direction": "higher",
-      "ref": [0, 200],
-      "why": "No guideline. Kept as a proxy for incidental vertical activity."
+      "why": "No universal clinical guideline is configured. Treat it as a personal incidental-activity trend."
     },
     "ActiveEnergyBurned": {
       "label": "Active energy",
       "direction": "higher",
-      "ref": [0, 3000],
-      "why": "Depends entirely on body mass and activity type; no population target is meaningful. Trend only."
+      "why": "The estimate depends on body metrics, device calibration and activity type. No population target is meaningful here."
     },
     "BasalEnergyBurned": {
       "label": "Basal energy",
       "direction": "band",
-      "why": "A device estimate from body metrics, not a measurement. Useful only to notice sudden discontinuities."
+      "why": "This is a device estimate from body metrics rather than a direct measurement. Use it to notice discontinuities, not as a goal."
     }
   },
 
   "systems": {
-    "_readme": "Groups for the coverage matrix — which parts of the picture have data in which year. Grouping by body system makes gaps visible instead of leaving them implied by absence.",
+    "_readme": "Groups for the coverage matrix. They show which kinds of data exist in each year; absence is not a medical finding.",
     "Activity": ["StepCount", "DistanceWalkingRunning", "FlightsClimbed", "AppleExerciseTime", "AppleStandHour", "ActiveEnergyBurned", "DistanceCycling"],
     "Cardio": ["RestingHeartRate", "HeartRate", "HeartRateVariabilitySDNN", "WalkingHeartRateAverage", "VO2Max"],
     "Respiratory": ["OxygenSaturation", "RespiratoryRate"],
