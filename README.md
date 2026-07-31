@@ -18,6 +18,9 @@ Health  21 metrics · newest 2026-01-15
   ...
 ```
 
+The output above is illustrative only. This repository contains no personal
+health records or live metrics.
+
 ## Why this exists
 
 HealthKit holds years of your own measurements and gives you almost no way to
@@ -57,8 +60,9 @@ iPhone HealthKit -> SyncHealth iOS app -> HTTPS POST /health
 1. Install the command-line receiver with `./install.sh`.
 2. Create `~/.synchealth/server.json` with a random token, bind address and
    port, then start `synchealth-server` (or install its LaunchAgent template).
-3. Make only `/health` reachable through an HTTPS tunnel or VPN if the phone
-   must sync outside your home network.
+3. If the phone must sync outside your home network, make only `/health`
+   reachable through an HTTPS tunnel (recommended). A VPN is an alternative
+   only when both the iPhone and Mac remain connected to it.
 4. Follow [the iOS build instructions](ios/README.md), enter that HTTPS URL
    and token in the app, and run **Full Sync** once.
 
@@ -91,7 +95,7 @@ background retry, while keeping the token in Keychain.
 
 ```
 phone -> POST https://<your-host>/health   (X-Health-Token)
-           ▼   tunnel or VPN
+           ▼   HTTPS tunnel (recommended) or persistent VPN
          synchealth-server on 127.0.0.1:8738
            ├─ raw/<ts>.json      verbatim payload, written before folding
            └─ health.db          same schema as the importer
@@ -115,13 +119,15 @@ API automation with the same URL and header.
 the moment you expose this endpoint it accepts blood oxygen and heart rate from
 anyone who finds it.
 
-Reaching the machine from anywhere needs a tunnel — the phone leaves your
-network and a LAN address stops resolving. [Cloudflare
+Reaching the machine from anywhere needs a reachable route — the phone leaves
+your network and a LAN address stops resolving. An HTTPS tunnel is the
+recommended route. [Cloudflare
 Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)
 works well here: the machine dials outbound, so no inbound port is opened, and
 it does not consume the phone's single VPN slot the way Tailscale or WireGuard
-does. iOS also tears down packet tunnels in the background, which makes a
-VPN-only setup unreliable for scheduled pushes.
+does. A VPN is a generic alternative for people who already operate one, not a
+requirement of this project; iOS can tear down packet tunnels in the background,
+which makes a VPN-only setup unreliable for scheduled pushes.
 
 Both paths write the same tables and can run together. A later complete export
 is authoritative for finished days, so it repairs a partial phone upload.
