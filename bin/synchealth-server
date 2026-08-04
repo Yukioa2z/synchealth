@@ -10,6 +10,8 @@ Runs on an always-on machine. Two ways in, both landing in one schema:
                  stages, stand hours, and the PRIVATE_TYPES set which lands in
                  its own table, out of every reporting path) and
                  activity_summaries (the rings).
+  GET  /health   authenticated receiver status metadata for the iOS dashboard:
+                 indexed reporting rows, database size and last payload time.
   GET  /health/summary?days=N   last-N-day digest, for eyeballing that the
                  pipeline is alive without opening sqlite
   GET  /health/alive            unauthenticated liveness, carries no data
@@ -222,6 +224,60 @@ def ensure_database(db):
     db.executescript(importer["SCHEMA"])
     db.executescript(importer["PRIVATE_SCHEMA"])
     ensure_runtime_schema(db)
+
+
+STATUS_TABLES = ("daily", "sleep", "workouts", "rings")
+
+
+def receiver_status(db, db_path=DB, raw_dir=RAW):
+    """Return metadata-only receiver status for the authenticated iOS UI.
+
+    `indexed_items` intentionally counts only the canonical reporting tables.
+    Push support tables (`samples`, `sleep_segments`), rich/private stores and
+    authority locks are excluded so this number is stable, non-duplicative and
+    does not disclose the presence of a sensitive HealthKit category.
+    """
+    table_counts = {
+        table: db.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+        for table in STATUS_TABLES
+    }
+    metric_count = db.execute(
+        "SELECT count(DISTINCT metric) FROM daily"
+    ).fetchone()[0]
+
+    database_bytes = 0
+    for candidate in (
+        Path(db_path),
+        Path(f"{db_path}-wal"),
+        Path(f"{db_path}-shm"),
+    ):
+        try:
+            database_bytes += candidate.stat().st_size
+        except FileNotFoundError:
+            pass
+
+    raw_payloads = 0
+    last_received_at = None
+    try:
+        for payload_path in Path(raw_dir).glob("*.json"):
+            try:
+                modified_at = payload_path.stat().st_mtime
+            except FileNotFoundError:
+                continue
+            raw_payloads += 1
+            if last_received_at is None or modified_at > last_received_at:
+                last_received_at = modified_at
+    except FileNotFoundError:
+        pass
+
+    return {
+        "ok": True,
+        "indexed_items": sum(table_counts.values()),
+        "metric_count": metric_count,
+        "database_bytes": database_bytes,
+        "raw_payloads": raw_payloads,
+        "last_received_at": last_received_at,
+    }
 
 
 def export_locked(db, day, metric):
@@ -672,6 +728,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?")[0].rstrip("/")
+        if path in ("/health", "/api/v1/ingest"):
+            if not self._authed():
+                return
+            db = sqlite3.connect(DB)
+            try:
+                status = receiver_status(db)
+            finally:
+                db.close()
+            return self._reply(200, status)
         if path == "/health/summary":
             if not self._authed():
                 return

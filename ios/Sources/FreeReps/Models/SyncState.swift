@@ -13,12 +13,15 @@ struct PersistedSnapshot: Codable {
     let lastSyncDate: Date?
     let lastAcknowledgementDate: Date?
     let categories: [PersistedCategory]
-    let totalRecords: Int?
+    let totalRecords: Int?  // legacy pre-dashboard count, decoded for migration only
     let hasCompletedFullSync: Bool?
     let backfillCursors: [String: Date]?
     let backfillAnchorDate: Date?
     let pendingQueueCount: Int?
     let lastDeliveryError: String?
+    let lifetimeAcknowledgedPoints: Int?
+    let lastRunDuration: TimeInterval?
+    let receiverStatus: ReceiverStatus?
 }
 
 // MARK: -
@@ -74,10 +77,13 @@ class SyncState: ObservableObject {
     @Published var isFullSyncRunning = false
     @Published var isIncrementalSyncRunning = false
     @Published var categories: [CategorySyncState] = []
-    @Published var totalRecords: Int = 0
     @Published var sessionAcknowledgedPoints: Int = 0
+    @Published var lifetimeAcknowledgedPoints: Int = 0
     @Published var lastSyncDate: Date?
     @Published var lastAcknowledgementDate: Date?
+    @Published var lastRunDuration: TimeInterval?
+    @Published var receiverStatus: ReceiverStatus?
+    @Published var receiverStatusError: String?
     @Published var overallProgress: Double = 0.0
     @Published var currentOperation: String = ""
     @Published var errorMessage: String?
@@ -105,9 +111,10 @@ class SyncState: ObservableObject {
         backfillCursors = [:]
         backfillAnchorDate = nil
         hasCompletedFullSync = false
+        sessionAcknowledgedPoints = 0
         lastSyncDate = nil
         lastAcknowledgementDate = nil
-        totalRecords = 0
+        lastRunDuration = nil
         currentOperation = ""
         errorMessage = nil
         for i in categories.indices {
@@ -138,8 +145,6 @@ class SyncState: ObservableObject {
         let completedCount = Double(categories.filter { $0.status == .completed }.count)
         let syncingProgress = categories.filter { $0.status.isActive }.map { $0.progressFraction }.reduce(0, +)
         overallProgress = (completedCount + syncingProgress) / total
-        // totalRecords is not summed from per-category session counts here —
-        // it is set directly from actual DB COUNT(*) queries in refreshRecordCounts().
     }
 
     // MARK: - Persistence
@@ -158,12 +163,15 @@ class SyncState: ObservableObject {
                     completed: $0.status == .completed
                 )
             },
-            totalRecords: totalRecords,
+            totalRecords: nil,
             hasCompletedFullSync: hasCompletedFullSync,
             backfillCursors: backfillCursors.isEmpty ? nil : backfillCursors,
             backfillAnchorDate: backfillAnchorDate,
             pendingQueueCount: pendingQueueCount,
-            lastDeliveryError: lastDeliveryError
+            lastDeliveryError: lastDeliveryError,
+            lifetimeAcknowledgedPoints: lifetimeAcknowledgedPoints,
+            lastRunDuration: lastRunDuration,
+            receiverStatus: receiverStatus
         )
         if let data = try? JSONEncoder().encode(snap) {
             UserDefaults.standard.set(data, forKey: Self.userDefaultsKey)
@@ -177,12 +185,16 @@ class SyncState: ObservableObject {
         else { return }
         lastSyncDate = snap.lastSyncDate
         lastAcknowledgementDate = snap.lastAcknowledgementDate
-        if let saved = snap.totalRecords { totalRecords = saved }
         hasCompletedFullSync = snap.hasCompletedFullSync ?? false
         backfillCursors = snap.backfillCursors ?? [:]
         backfillAnchorDate = snap.backfillAnchorDate
         pendingQueueCount = snap.pendingQueueCount ?? 0
         lastDeliveryError = snap.lastDeliveryError
+        // Migrate any count written by older builds, while keeping the new
+        // lifetime counter independent from resettable sync progress.
+        lifetimeAcknowledgedPoints = snap.lifetimeAcknowledgedPoints ?? snap.totalRecords ?? 0
+        lastRunDuration = snap.lastRunDuration
+        receiverStatus = snap.receiverStatus
         for persisted in snap.categories {
             guard let idx = categories.firstIndex(where: { $0.id == persisted.id }) else { continue }
             categories[idx].recordCount = persisted.recordCount

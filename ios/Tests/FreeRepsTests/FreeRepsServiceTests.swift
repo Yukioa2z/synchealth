@@ -37,6 +37,50 @@ final class FreeRepsServiceTests: XCTestCase {
         XCTAssertEqual(acknowledgement, IngestAcknowledgement(points: 3))
     }
 
+    func testStatusUsesExactEndpointAndDecodesMetadata() async throws {
+        URLProtocolStub.handler = { request in
+            XCTAssertEqual(request.url?.absoluteString, "https://your-host.example/health")
+            XCTAssertEqual(request.httpMethod, "GET")
+            XCTAssertEqual(
+                request.value(forHTTPHeaderField: "X-Health-Token"),
+                "test-secret"
+            )
+            XCTAssertNil(URLProtocolStub.bodyData(from: request))
+            return (
+                HTTPURLResponse(
+                    url: try XCTUnwrap(request.url),
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: nil
+                )!,
+                Data(
+                    #"""
+                    {
+                      "indexed_items": 7162114,
+                      "metric_count": 25,
+                      "database_bytes": 12582912,
+                      "raw_payloads": 34,
+                      "last_received_at": 1785859200
+                    }
+                    """#.utf8
+                )
+            )
+        }
+        let service = FreeRepsService(
+            config: .default,
+            session: URLProtocolStub.session(),
+            tokenProvider: { "test-secret" }
+        )
+
+        let status = try await service.fetchStatus()
+
+        XCTAssertEqual(status.indexedItems, 7_162_114)
+        XCTAssertEqual(status.metricCount, 25)
+        XCTAssertEqual(status.databaseBytes, 12_582_912)
+        XCTAssertEqual(status.rawPayloads, 34)
+        XCTAssertEqual(status.lastReceivedAt, 1_785_859_200)
+    }
+
     /// A non-200 response is not an acknowledgement and must remain retryable by the queue.
     func testIngestRejectsNon200() async {
         let token = "do-not-leak-this-test-token"

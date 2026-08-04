@@ -3,6 +3,15 @@ import Foundation
 import HealthKit
 import SwiftUI
 
+enum SyncSummaryStatus {
+    case syncing
+    case healthy
+    case needsBaseline
+    case waitingToSend
+    case needsAttention
+    case notSynced
+}
+
 @MainActor
 final class SyncViewModel: ObservableObject {
 
@@ -10,11 +19,14 @@ final class SyncViewModel: ObservableObject {
     private let syncService: SyncService
     private var cancellables = Set<AnyCancellable>()
     private var syncTask: Task<Void, Never>?
+    private let isDesignPreview: Bool
 
     @Published var prerequisiteIssues: [SyncPrerequisiteIssue] = []
     @Published var showPrerequisiteAlert = false
+    @Published var isRefreshingStatus = false
 
-    init() {
+    init(isDesignPreview: Bool = false) {
+        self.isDesignPreview = isDesignPreview
         let state = SyncState()
         self.syncState = state
         self.syncService = SyncService(syncState: state)
@@ -23,15 +35,24 @@ final class SyncViewModel: ObservableObject {
         state.objectWillChange
             .sink { [weak self] in self?.objectWillChange.send() }
             .store(in: &cancellables)
+
+        #if DEBUG
+        if isDesignPreview {
+            applyDesignPreviewState()
+        }
+        #endif
     }
 
     var categories: [CategorySyncState] { syncState.categories }
     var isFullSyncRunning: Bool { syncState.isFullSyncRunning }
     var isAnySyncRunning: Bool { syncState.isAnySyncRunning }
-    var totalRecords: Int { syncState.totalRecords }
     var sessionAcknowledgedPoints: Int { syncState.sessionAcknowledgedPoints }
+    var lifetimeAcknowledgedPoints: Int { syncState.lifetimeAcknowledgedPoints }
     var lastSyncDate: Date? { syncState.lastSyncDate }
     var lastAcknowledgementDate: Date? { syncState.lastAcknowledgementDate }
+    var lastRunDuration: TimeInterval? { syncState.lastRunDuration }
+    var receiverStatus: ReceiverStatus? { syncState.receiverStatus }
+    var receiverStatusError: String? { syncState.receiverStatusError }
     var pendingQueueCount: Int { syncState.pendingQueueCount }
     var lastDeliveryError: String? { syncState.lastDeliveryError }
     var overallProgress: Double { syncState.overallProgress }
@@ -44,14 +65,55 @@ final class SyncViewModel: ObservableObject {
             && syncState.lastSyncDate == nil
     }
 
-    var lastSyncLabel: String {
-        guard let date = lastAcknowledgementDate else { return "No acknowledged push yet" }
+    var completedStreamCount: Int {
+        categories.filter { $0.status == .completed }.count
+    }
+
+    var totalStreamCount: Int {
+        categories.count
+    }
+
+    var lastStatusDate: Date? {
+        [lastAcknowledgementDate, receiverStatus?.lastReceivedDate]
+            .compactMap { $0 }
+            .max()
+    }
+
+    var lastSyncRelativeLabel: String {
+        guard let date = lastStatusDate else { return "not yet" }
+        if abs(date.timeIntervalSinceNow) < 60 {
+            return "just now"
+        }
         let rel = RelativeDateTimeFormatter()
         rel.unitsStyle = .full
-        return "Last acknowledged \(rel.localizedString(for: date, relativeTo: Date()))"
+        return rel.localizedString(for: date, relativeTo: Date())
+    }
+
+    var summaryStatus: SyncSummaryStatus {
+        if isAnySyncRunning {
+            return .syncing
+        }
+        if lastDeliveryError != nil || errorMessage != nil || receiverStatusError != nil {
+            return .needsAttention
+        }
+        if pendingQueueCount > 0 {
+            return .waitingToSend
+        }
+        if !hasCompletedFullSync {
+            return .needsBaseline
+        }
+        let hasFailedStream = categories.contains {
+            if case .failed = $0.status { return true }
+            return false
+        }
+        if hasFailedStream || categories.contains(where: { $0.daysBehind != nil }) {
+            return .needsAttention
+        }
+        return lastStatusDate == nil ? .notSynced : .healthy
     }
 
     func checkPrerequisites() {
+        guard !isDesignPreview else { return }
         let config = FreeRepsConfig.load()
         Task {
             let issues = await syncService.validatePrerequisites(config: config)
@@ -71,6 +133,7 @@ final class SyncViewModel: ObservableObject {
         }
         let task = Task {
             await syncService.runFullSync(config: config)
+            await syncService.refreshReceiverStatus(config: config)
             refreshLatestHealthKitDates()
         }
         syncTask = task
@@ -85,6 +148,7 @@ final class SyncViewModel: ObservableObject {
             } else {
                 await syncService.runIncrementalSync(config: config)
             }
+            await syncService.refreshReceiverStatus(config: config)
             refreshLatestHealthKitDates()
         }
         syncTask = task
@@ -105,6 +169,7 @@ final class SyncViewModel: ObservableObject {
         let config = FreeRepsConfig.load()
         syncTask = Task {
             await syncService.runSingleCategorySync(categoryID: categoryID, config: config)
+            await syncService.refreshReceiverStatus(config: config)
             refreshLatestHealthKitDates()
         }
     }
@@ -116,6 +181,7 @@ final class SyncViewModel: ObservableObject {
             for catID in categoryIDs {
                 await syncService.runSingleCategorySync(categoryID: catID, config: config)
             }
+            await syncService.refreshReceiverStatus(config: config)
             refreshLatestHealthKitDates()
         }
         syncTask = task
@@ -135,6 +201,7 @@ final class SyncViewModel: ObservableObject {
     }
 
     func refreshLatestHealthKitDates() {
+        guard !isDesignPreview else { return }
         Task {
             for i in syncState.categories.indices {
                 let date = await latestHKDate(for: syncState.categories[i].id)
@@ -198,10 +265,44 @@ final class SyncViewModel: ObservableObject {
         }
     }
 
-    func refreshRecordCounts() {
-        // Record counts are tracked locally in SyncState from ingest results.
-        // No direct DB query needed — counts accumulate from successful sync operations.
-        syncState.persist()
-        Task { await syncService.refreshQueueStatus() }
+    func refreshStatus() {
+        guard !isDesignPreview else { return }
+        guard !isRefreshingStatus else { return }
+        isRefreshingStatus = true
+        let config = FreeRepsConfig.load()
+        Task {
+            await syncService.refreshQueueStatus()
+            await syncService.refreshReceiverStatus(config: config)
+            isRefreshingStatus = false
+        }
     }
+
+    #if DEBUG
+    static func designPreview() -> SyncViewModel {
+        SyncViewModel(isDesignPreview: true)
+    }
+
+    private func applyDesignPreviewState() {
+        let now = Date()
+        syncState.hasCompletedFullSync = true
+        syncState.lastSyncDate = now
+        syncState.lastAcknowledgementDate = now
+        syncState.lastRunDuration = 1.3
+        syncState.sessionAcknowledgedPoints = 0
+        syncState.lifetimeAcknowledgedPoints = 5_589_597
+        syncState.pendingQueueCount = 0
+        syncState.receiverStatus = ReceiverStatus(
+            indexedItems: 7_162_114,
+            metricCount: 25,
+            databaseBytes: 12_582_912,
+            rawPayloads: 34,
+            lastReceivedAt: now.timeIntervalSince1970
+        )
+        for index in syncState.categories.indices {
+            syncState.categories[index].status = .completed
+            syncState.categories[index].lastSyncDate = now
+        }
+        syncState.recalcOverall()
+    }
+    #endif
 }

@@ -67,6 +67,14 @@ alternative.
 The receiver initializes an empty database on first start, so the first Full
 Sync establishes the complete local history without a manual export.
 
+The same authenticated ingest URL supports a metadata-only `GET` for the iOS
+status card. Its `indexed_items` value counts the canonical reporting tables
+(`daily`, `sleep`, `workouts`, and `rings`) rather than summing every SQLite
+support table, which would double-count rolling-window samples. Database size
+includes SQLite's WAL and shared-memory files. Sensitive and rich event tables
+are deliberately omitted from this dashboard count; their data remains stored
+and explicitly queryable.
+
 ## Why re-sends had to be designed for
 
 Every emitter in this space re-sends. HAE automations post rolling windows,

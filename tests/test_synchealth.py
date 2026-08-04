@@ -4,7 +4,10 @@ import runpy
 import sqlite3
 import subprocess
 import tempfile
+import threading
 import unittest
+import urllib.error
+import urllib.request
 from datetime import date
 from pathlib import Path
 
@@ -71,6 +74,71 @@ class SyncHealthTests(unittest.TestCase):
             )}
         self.assertTrue({"daily", "samples", "private_events", "generic_events"}
                         <= tables)
+
+    def test_receiver_status_reports_safe_index_and_storage_metadata(self):
+        self.import_xml(
+            health_xml(
+                quantity("StepCount", "2026-03-08", 10),
+                '<ActivitySummary dateComponents="2026-03-08" '
+                'activeEnergyBurned="100" appleExerciseTime="20" '
+                'appleStandHours="10" appleMoveTime="0"/>',
+            )
+        )
+        raw_dir = self.home / "raw"
+        raw_dir.mkdir()
+        (raw_dir / "payload.json").write_text("{}", encoding="utf-8")
+        server = runpy.run_path(str(SERVER))
+
+        with self.connect() as con:
+            status = server["receiver_status"](
+                con,
+                db_path=self.db_path,
+                raw_dir=raw_dir,
+            )
+            expected_indexed_items = sum(
+                con.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+                for table in ("daily", "sleep", "workouts", "rings")
+            )
+
+        self.assertTrue(status["ok"])
+        self.assertEqual(status["indexed_items"], expected_indexed_items)
+        self.assertEqual(status["metric_count"], 1)
+        self.assertEqual(status["raw_payloads"], 1)
+        self.assertGreater(status["database_bytes"], 0)
+        self.assertIsNotNone(status["last_received_at"])
+
+    def test_receiver_status_get_uses_ingest_auth(self):
+        self.home.mkdir()
+        server = runpy.run_path(str(SERVER))
+        runtime = server["Handler"].do_GET.__globals__
+        runtime["HOME"] = self.home
+        runtime["DB"] = self.db_path
+        runtime["RAW"] = self.home / "raw"
+        with sqlite3.connect(self.db_path) as con:
+            server["ensure_database"](con)
+
+        httpd = server["Server"](("127.0.0.1", 0), "test-status-secret")
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        url = f"http://127.0.0.1:{httpd.server_port}/health"
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as rejected:
+                urllib.request.urlopen(url, timeout=2)
+            self.assertEqual(rejected.exception.code, 401)
+            rejected.exception.close()
+
+            request = urllib.request.Request(
+                url,
+                headers={"X-Health-Token": "test-status-secret"},
+            )
+            with urllib.request.urlopen(request, timeout=2) as response:
+                status = json.load(response)
+            self.assertTrue(status["ok"])
+            self.assertEqual(status["indexed_items"], 0)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=2)
 
     def test_dst_interval_uses_timezone_offsets(self):
         module = runpy.run_path(str(IMPORTER))

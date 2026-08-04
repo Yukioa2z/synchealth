@@ -101,6 +101,12 @@ phone -> POST https://<your-host>/health   (X-Health-Token)
            └─ health.db          same schema as the importer
 ```
 
+The iOS dashboard also sends an authenticated `GET` to that exact `/health`
+URL. It receives metadata only: canonical indexed-row count, numeric metric
+count, database size, raw-payload count and newest payload time. No health
+values or category names are returned, and no additional public route is
+required.
+
 ```bash
 mkdir -p ~/.synchealth
 cat > ~/.synchealth/server.json <<'EOF'

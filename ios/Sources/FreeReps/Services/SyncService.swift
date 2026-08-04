@@ -138,6 +138,17 @@ final class SyncService: ObservableObject {
         syncState.persist()
     }
 
+    func refreshReceiverStatus(config: FreeRepsConfig) async {
+        let service = FreeRepsService(config: config)
+        do {
+            syncState.receiverStatus = try await service.fetchStatus()
+            syncState.receiverStatusError = nil
+        } catch {
+            syncState.receiverStatusError = error.localizedDescription
+        }
+        syncState.persist()
+    }
+
     /// Drains persisted batches without reading HealthKit. Used on every app launch.
     func drainPendingQueue(config: FreeRepsConfig) async {
         connectFreeReps(config: config)
@@ -212,6 +223,8 @@ final class SyncService: ObservableObject {
 
     func runSingleCategorySync(categoryID: String, config: FreeRepsConfig) async {
         guard !syncState.isAnySyncRunning else { return }
+        let sessionStartedAt = Date()
+        defer { finishRun(startedAt: sessionStartedAt) }
         syncState.sessionAcknowledgedPoints = 0
         syncState.isFullSyncRunning = true
         SyncService.isSyncRunning = true
@@ -296,6 +309,8 @@ final class SyncService: ObservableObject {
 
     func runHistoricalBackfill(config: FreeRepsConfig) async {
         guard !syncState.isAnySyncRunning else { return }
+        let sessionStartedAt = Date()
+        defer { finishRun(startedAt: sessionStartedAt) }
         syncState.sessionAcknowledgedPoints = 0
         syncState.isFullSyncRunning = true
         SyncService.isSyncRunning = true
@@ -646,6 +661,8 @@ final class SyncService: ObservableObject {
 
     func runIncrementalSync(config: FreeRepsConfig) async {
         guard !syncState.isAnySyncRunning else { return }
+        let sessionStartedAt = Date()
+        defer { finishRun(startedAt: sessionStartedAt) }
         syncState.sessionAcknowledgedPoints = 0
         syncState.isIncrementalSyncRunning = true
         SyncService.isSyncRunning = true
@@ -999,9 +1016,11 @@ final class SyncService: ObservableObject {
         let pendingCount = try await uploadQueue.pendingCount()
         syncState.pendingQueueCount = pendingCount
         if !deliveries.isEmpty {
-            syncState.sessionAcknowledgedPoints += deliveries.reduce(0) {
+            let acknowledgedPoints = deliveries.reduce(0) {
                 $0 + $1.acknowledgement.points
             }
+            syncState.sessionAcknowledgedPoints += acknowledgedPoints
+            syncState.lifetimeAcknowledgedPoints += acknowledgedPoints
             syncState.lastAcknowledgementDate = Date()
             syncState.lastDeliveryError = nil
         } else if pendingCount == 0 {
@@ -1009,6 +1028,11 @@ final class SyncService: ObservableObject {
         }
         syncState.persist()
         return deliveries
+    }
+
+    private func finishRun(startedAt: Date) {
+        syncState.lastRunDuration = max(0, Date().timeIntervalSince(startedAt))
+        syncState.persist()
     }
 
     private func recordQueueFailure(_ error: Error) async {

@@ -48,10 +48,12 @@ ios/scripts/install-renewal-job.sh \
   --bundle-id <your-unique-bundle-id>
 ```
 
-It runs daily at 09:00 and only reinstalls when the last successful renewal is
-older than five days. The Mac must be awake and the iPhone must be connected by
-cable or reachable on the same network. If that is not true, the app can still
-expire; reconnect it and run the copied renewal script with `--force`.
+It runs daily at 09:00, reads the signed app's actual provisioning-profile
+expiration, and reinstalls when fewer than 48 hours remain. A build is treated
+as fresh only after a successful device install. The Mac must be awake and the
+iPhone must be connected by cable or reachable on the same network. If that is
+not true, the app can still expire; reconnect it and run the copied renewal
+script with `--force`.
 
 ## Test
 

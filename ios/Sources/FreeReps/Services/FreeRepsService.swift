@@ -17,7 +17,7 @@ enum FreeRepsError: LocalizedError, Equatable {
         case .httpError(let code):
             return "The SyncHealth receiver returned HTTP \(code)."
         case .decodingError(let message):
-            return "The SyncHealth acknowledgement could not be decoded: \(message)"
+            return "The SyncHealth receiver response could not be decoded: \(message)"
         case .connectionFailed(let message):
             return "Could not reach the SyncHealth receiver: \(message)"
         }
@@ -27,6 +27,27 @@ enum FreeRepsError: LocalizedError, Equatable {
 /// Acknowledgement returned by SyncHealth after processing an ingest payload.
 struct IngestAcknowledgement: Codable, Equatable {
     let points: Int
+}
+
+/// Metadata-only status returned by an authenticated GET to the ingest endpoint.
+struct ReceiverStatus: Codable, Equatable {
+    let indexedItems: Int
+    let metricCount: Int
+    let databaseBytes: Int
+    let rawPayloads: Int
+    let lastReceivedAt: TimeInterval?
+
+    enum CodingKeys: String, CodingKey {
+        case indexedItems = "indexed_items"
+        case metricCount = "metric_count"
+        case databaseBytes = "database_bytes"
+        case rawPayloads = "raw_payloads"
+        case lastReceivedAt = "last_received_at"
+    }
+
+    var lastReceivedDate: Date? {
+        lastReceivedAt.map(Date.init(timeIntervalSince1970:))
+    }
 }
 
 /// Lightweight HTTP client for the single SyncHealth ingest endpoint.
@@ -62,21 +83,8 @@ actor FreeRepsService {
 
     /// POSTs an already encoded payload. The durable queue uses this path for retries.
     func ingest(encodedPayload: Data) async throws -> IngestAcknowledgement {
-        guard let endpointURL else {
-            throw FreeRepsError.invalidURL
-        }
-        guard let storedToken = try tokenProvider() else {
-            throw FreeRepsError.missingToken
-        }
-        let token = storedToken.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !token.isEmpty else {
-            throw FreeRepsError.missingToken
-        }
-
-        var request = URLRequest(url: endpointURL)
-        request.httpMethod = "POST"
+        var request = try authenticatedRequest(method: "POST")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue(token, forHTTPHeaderField: "X-Health-Token")
         request.httpBody = encodedPayload
 
         let (data, response) = try await performRequest(request)
@@ -93,6 +101,43 @@ actor FreeRepsService {
             throw FreeRepsError.decodingError(error.localizedDescription)
         }
     }
+
+    /// Reads metadata for the dashboard without returning any health values.
+    func fetchStatus() async throws -> ReceiverStatus {
+        let request = try authenticatedRequest(method: "GET")
+        let (data, response) = try await performRequest(request)
+        guard let http = response as? HTTPURLResponse else {
+            throw FreeRepsError.connectionFailed("Invalid response")
+        }
+        guard http.statusCode == 200 else {
+            throw FreeRepsError.httpError(statusCode: http.statusCode)
+        }
+
+        do {
+            return try JSONDecoder().decode(ReceiverStatus.self, from: data)
+        } catch {
+            throw FreeRepsError.decodingError(error.localizedDescription)
+        }
+    }
+
+    private func authenticatedRequest(method: String) throws -> URLRequest {
+        guard let endpointURL else {
+            throw FreeRepsError.invalidURL
+        }
+        guard let storedToken = try tokenProvider() else {
+            throw FreeRepsError.missingToken
+        }
+        let token = storedToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty else {
+            throw FreeRepsError.missingToken
+        }
+
+        var request = URLRequest(url: endpointURL)
+        request.httpMethod = method
+        request.setValue(token, forHTTPHeaderField: "X-Health-Token")
+        return request
+    }
+
     private func performRequest(_ request: URLRequest) async throws -> (Data, URLResponse) {
         do {
             return try await session.data(for: request)

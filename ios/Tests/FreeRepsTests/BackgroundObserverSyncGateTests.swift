@@ -79,7 +79,10 @@ final class BackgroundObserverSyncGateTests: XCTestCase {
             backfillCursors: nil,
             backfillAnchorDate: nil,
             pendingQueueCount: 0,
-            lastDeliveryError: nil
+            lastDeliveryError: nil,
+            lifetimeAcknowledgedPoints: nil,
+            lastRunDuration: 1.3,
+            receiverStatus: nil
         )
         defaults.set(try! JSONEncoder().encode(snapshot), forKey: Self.snapshotKey)
 
@@ -96,6 +99,7 @@ final class BackgroundObserverSyncGateTests: XCTestCase {
 
         XCTAssertTrue(context.state.hasCompletedFullSync)
         XCTAssertEqual(context.state.lastSyncDate, expectedLastSyncDate)
-        XCTAssertEqual(context.state.totalRecords, 42)
+        XCTAssertEqual(context.state.lifetimeAcknowledgedPoints, 42)
+        XCTAssertEqual(context.state.lastRunDuration, 1.3)
     }
 }
